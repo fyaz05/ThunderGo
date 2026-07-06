@@ -1,0 +1,51 @@
+# ThunderGo — Docker Compose
+#
+# Usage:
+#   1. Copy .env.example to .env and fill in the REQUIRED fields
+#   2. Set TG_MONGO_URI to your MongoDB connection string
+#      (Atlas free tier: mongodb+srv://user:pass@cluster.mongodb.net)
+#   3. docker compose up --build
+#
+# ThunderGo does NOT ship a self-hosted MongoDB. Use Atlas or your own Mongo.
+
+services:
+  thundergo:
+    build: .
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - thundergo-data:/app/data
+    # Hardening
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    pids_limit: 100
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Distroless has no shell — use the binary's -healthcheck flag
+    healthcheck:
+      test: ["CMD", "/app/thundergo", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    networks:
+      - frontend
+
+networks:
+  frontend:
+
+volumes:
+  thundergo-data:

@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: thundergo
+    env: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: TG_API_ID
+        sync: false
+      - key: TG_API_HASH
+        sync: false
+      - key: TG_BOT_TOKEN
+        sync: false
+      - key: TG_VAULT_CHANNEL_ID
+        sync: false
+      - key: TG_OWNER_USER_ID
+        sync: false
+      - key: TG_MONGO_URI
+        sync: false
+      - key: TG_URL
+        sync: false

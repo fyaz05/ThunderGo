@@ -1,0 +1,26 @@
+# Build artifacts
+bin/
+thundergo.exe
+thundergo
+*.log
+bot_*.session
+*.session
+
+# Local env
+.env
+.env.*
+!.env.example
+
+# Runtime data
+data/
+
+# Test/coverage artifacts
+*.test
+*.out
+cover.out
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
