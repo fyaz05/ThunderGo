@@ -1,0 +1,61 @@
+{
+  "name": "ThunderGo",
+  "description": "Telegram File-to-Link Bot — Direct Links & Streaming in Go",
+  "repository": "https://github.com/fyaz05/ThunderGo",
+  "logo": "https://cdn.jsdelivr.net/gh/fyaz05/Resources@main/ThunderGo/logo.png",
+  "keywords": [
+    "telegram",
+    "file-sharing",
+    "streaming",
+    "golang",
+    "go",
+    "bot"
+  ],
+  "stack": "container",
+  "success_url": "/health",
+  "env": {
+    "TG_API_ID": {
+      "description": "Telegram API ID — get from https://my.telegram.org → API development tools",
+      "required": true
+    },
+    "TG_API_HASH": {
+      "description": "Telegram API hash — get from https://my.telegram.org → API development tools",
+      "required": true
+    },
+    "TG_BOT_TOKEN": {
+      "description": "Bot token from @BotFather (format: NNNNNNNNNN:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx)",
+      "required": true
+    },
+    "TG_VAULT_CHANNEL_ID": {
+      "description": "Private vault channel ID (must start with -100, e.g. -1001234567890). Create a private channel, add the bot as admin with Post Messages, forward a message from it to @userinfobot, and paste the ID here.",
+      "required": true
+    },
+    "TG_OWNER_USER_ID": {
+      "description": "Your Telegram user ID — send /start to @userinfobot to get it",
+      "required": true
+    },
+    "TG_MONGO_URI": {
+      "description": "MongoDB connection string (MongoDB Atlas free tier M0 cluster recommended). Format: mongodb+srv://user:pass@cluster0.abcde.mongodb.net/?retryWrites=true&w=majority",
+      "required": true
+    },
+    "TG_URL": {
+      "description": "Leave the default for now. After deploy, Heroku assigns your app a URL like https://APP-NAME.herokuapp.com — run: heroku config:set TG_URL=https://APP-NAME.herokuapp.com",
+      "required": true,
+      "value": "https://CHANGE_ME.herokuapp.com"
+    },
+    "TG_BIND_ADDRESS": {
+      "description": "Must be 0.0.0.0 on Heroku (Heroku rejects loopback binds)",
+      "required": false,
+      "value": "0.0.0.0"
+    },
+    "TG_EXTRA_BOTS1": {
+      "description": "(Optional) Extra bot token for higher download throughput — create via @BotFather, add as admin to vault channel. Add more: TG_EXTRA_BOTS2, TG_EXTRA_BOTS3, etc.",
+      "required": false
+    },
+    "TG_KEEPALIVE_SECS": {
+      "description": "Self-ping interval in seconds to keep the free dyno awake (0 = disabled on paid plans)",
+      "required": false,
+      "value": "300"
+    }
+  }
+}

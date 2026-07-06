@@ -17,7 +17,7 @@
 <p align="center">
   <a href="https://app.koyeb.com/deploy?type=docker&image=ghcr.io/fyaz05/thundergo:latest&name=thundergo&ports=8080;http;/&env%5BTG_API_ID%5D=&env%5BTG_API_HASH%5D=&env%5BTG_BOT_TOKEN%5D=&env%5BTG_VAULT_CHANNEL_ID%5D=&env%5BTG_OWNER_USER_ID%5D=&env%5BTG_MONGO_URI%5D=&env%5BTG_URL%5D="><img src="https://img.shields.io/badge/Deploy%20to-Koyeb-blue?style=for-the-badge&logo=koyeb" alt="Deploy to Koyeb"></a>
   <a href="https://render.com/deploy"><img src="https://img.shields.io/badge/Deploy%20to-Render-blue?style=for-the-badge&logo=render" alt="Deploy to Render"></a>
-  <a href="https://heroku.com/deploy"><img src="https://img.shields.io/badge/Deploy%20to-Heroku-purple?style=for-the-badge&logo=heroku" alt="Deploy to Heroku"></a>
+  <a href="https://heroku.com/deploy?template=https://github.com/fyaz05/ThunderGo"><img src="https://img.shields.io/badge/Deploy%20to-Heroku-purple?style=for-the-badge&logo=heroku" alt="Deploy to Heroku"></a>
 </p>
 
 ---
@@ -194,7 +194,7 @@ Deploy directly to a PaaS using the pre-built Docker image from GHCR:
 |---|---|
 | **Koyeb** | Click the badge above — set your 7 env vars in the Koyeb dashboard after deploy |
 | **Render** | Click the badge → create a new Web Service → pick the `ghcr.io/fyaz05/thundergo:latest` Docker image → set env vars |
-| **Heroku** | `heroku create && heroku stack:set container && heroku config:set TG_... && git push heroku main` (see [Deployment Guide](docs/DEPLOYMENT.md)) |
+| **Heroku** | Click the **Deploy to Heroku** badge above — fill in the 7 env vars and deploy instantly. Or use the CLI: `heroku create && heroku stack:set container && heroku config:set TG_... && git push heroku main` (see [Deployment Guide](docs/DEPLOYMENT.md)) |
 
 **Non-Docker deployments** (Heroku buildpack, bare metal, VPS): use `Procfile` + `thunder.sh`. Set `UPSTREAM_REPO` to auto-update on restart (requires Go + git at runtime).
 

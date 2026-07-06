@@ -83,6 +83,8 @@ docker compose down                # stop + remove containers (keeps volumes)
 
 Heroku restarts dynos daily (every 24h). Two deploy options:
 
+> **One-click deploy:** Click the Deploy to Heroku badge in the [README](../README.md) — fill in the 7 required env vars and deploy instantly. Then run `heroku config:set TG_URL=https://YOUR-APP.herokuapp.com` with your actual URL.
+
 #### Docker (recommended — uses `heroku.yml`)
 
 Pre-compiled binary, fastest restart. Updates: push a new GHCR release → Heroku pulls the latest `:latest` tag on the next 24h restart (or manual `heroku restart`).
