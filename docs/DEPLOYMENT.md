@@ -81,11 +81,31 @@ docker compose down                # stop + remove containers (keeps volumes)
 
 ### Option B: Heroku
 
-Heroku restarts dynos daily (every 24h). Two deploy options:
+Heroku restarts dynos daily (every 24h). Four deploy options:
 
-> **One-click deploy:** Click the Deploy to Heroku badge in the [README](../README.md) — fill in the 7 required env vars and deploy instantly. Then run `heroku config:set TG_URL=https://YOUR-APP.herokuapp.com` with your actual URL.
+> **One-click deploy:** Click the Deploy to Heroku badge in the [README](../README.md) — fill in the 7 required env vars and deploy instantly. TG_URL has a placeholder — after deploy, run `heroku config:set TG_URL=https://YOUR-APP.herokuapp.com` with your actual URL.
 
-#### Docker (recommended — uses `heroku.yml`)
+#### Container Registry (`heroku container:push`)
+
+Builds the Docker image locally and pushes it directly to Heroku's registry.
+
+```bash
+heroku create my-thundergo
+heroku stack:set container
+heroku config:set TG_API_ID=... TG_API_HASH=... TG_BOT_TOKEN=...
+heroku config:set TG_VAULT_CHANNEL_ID=-1001234567890
+heroku config:set TG_OWNER_USER_ID=123456789
+heroku config:set TG_MONGO_URI=mongodb+srv://...
+heroku config:set TG_URL=https://my-thundergo.herokuapp.com
+heroku config:set TG_BIND_ADDRESS=0.0.0.0
+heroku container:push web
+heroku container:release web
+heroku ps:scale web=1
+```
+
+> The `ENTRYPOINT ["/app/thundergo"]` in the Dockerfile is used directly — no `heroku.yml` required.
+
+#### Docker build on Heroku (recommended — uses `heroku.yml`)
 
 Pre-compiled binary, fastest restart. Updates: push a new GHCR release → Heroku pulls the latest `:latest` tag on the next 24h restart (or manual `heroku restart`).
 
