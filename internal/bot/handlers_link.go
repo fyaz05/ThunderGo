@@ -7,12 +7,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/amarnathcjd/gogram/telegram"
 
 	"github.com/fyaz05/ThunderGo/internal/ingest"
 	"github.com/fyaz05/ThunderGo/internal/store"
+	"github.com/fyaz05/ThunderGo/internal/tgutil"
 )
 
 // handleLink is the group /link command. With no arg it processes the replied-to
@@ -91,12 +93,12 @@ func (b *Bot) linkSingle(c *Context) error {
 	downloadURL := b.Cfg.FileRawURL(result.File.Hash, result.File.FileName)
 	streamURL, downloadURL = b.maybeShorten(c, streamURL, downloadURL)
 
-	text := formatLinkMessage(result.File, streamURL, downloadURL, result.Reused)
+	text := formatLinkMessage(result.File, streamURL, downloadURL, result.Reused, b.Cfg.FileTTLDays)
 	b.editStatusWithButtons(status, text, streamURL, downloadURL)
 
 	// Send the same links in a private message. If the DM fails (user blocked
 	// the bot), tell them in the group.
-	if !b.sendPrivateLinksChecked(c.Msg.SenderID(), result.File, streamURL, downloadURL, result.Reused) {
+	if !b.sendPrivateLinksChecked(c.Msg.SenderID(), result.File, streamURL, downloadURL, result.Reused, chatTitle(c.Msg)) {
 		_, _ = c.Msg.Respond(msgErrDMBlocked)
 	}
 
@@ -170,19 +172,24 @@ func (b *Bot) linkBatch(c *Context, n int) error {
 	const chunkDelay = 1500 * time.Millisecond
 
 	succeeded := 0
-	skipped := 0 // non-media messages in the batch range.
+	skipped := 0
 	failed := 0
-	dmFailed := 0 // chunks that could not be DM'd to the requester.
+	dmFailed := 0
 	var chunk []string
 
 	flushChunk := func() {
 		if len(chunk) == 0 {
 			return
 		}
-		text := strings.Join(chunk, "\n\n---\n\n")
-		_, _ = c.Msg.Respond(text, &telegram.SendOptions{ParseMode: "HTML"})
-		// Best-effort DM; failures surfaced via dmFailed at the end.
-		if _, err := primary.SendMessage(c.Msg.SenderID(), text, &telegram.SendOptions{ParseMode: "HTML"}); err != nil {
+		groupText := fmt.Sprintf(msgBatchLinksReady, len(chunk)) + "\n\n" + strings.Join(chunk, "\n\n---\n\n")
+		_, _ = c.Msg.Respond(groupText, &telegram.SendOptions{ParseMode: "HTML"})
+		// Best-effort DM with batch prefix; failures surfaced via dmFailed at the end.
+		title := chatTitle(c.Msg)
+		if title == "" {
+			title = msgFallbackChatTitle
+		}
+		dmText := fmt.Sprintf(msgDMBatchPrefix, html.EscapeString(title)) + "\n" + groupText
+		if _, err := primary.SendMessage(c.Msg.SenderID(), dmText, &telegram.SendOptions{ParseMode: "HTML"}); err != nil {
 			dmFailed++
 			b.Log.Debug("batch DM send failed",
 				"user_id", c.Msg.SenderID(), "chunk_size", len(chunk), "error", err)
@@ -196,11 +203,12 @@ func (b *Bot) linkBatch(c *Context, n int) error {
 
 	// Process ingest+shorten concurrently in a 5-worker pool. Results are written
 	// to an index-keyed slice so chronological flush order is preserved.
+	// Live progress is shown by editing the status message every 5 completions.
 	const numWorkers = 5
 
 	type batchResult struct {
-		index     int    // original chronological index into msgs
-		text      string // formatted link message (after shortening)
+		index     int
+		text      string
 		succeeded bool
 		skipped   bool
 		failed    bool
@@ -208,7 +216,27 @@ func (b *Bot) linkBatch(c *Context, n int) error {
 
 	results := make([]batchResult, len(msgs))
 
-	// Producer: feed message indices into a channel; close on cancel.
+	var atomicProcessed atomic.Int64
+	var atomicFailed atomic.Int64
+	total := int64(len(msgs))
+	lastProgressUpdate := atomic.Int64{}
+	var progressMu sync.Mutex
+
+	// updateProgress edits the status message to show live progress.
+	// Throttled to every 5 completions to avoid Telegram flood-waits.
+	updateProgress := func() {
+		processed := atomicProcessed.Load()
+		failed := atomicFailed.Load()
+		if processed-lastProgressUpdate.Load() < 5 && processed < total {
+			return
+		}
+		lastProgressUpdate.Store(processed)
+		text := fmt.Sprintf(msgProcessingStatus, processed, total, failed)
+		progressMu.Lock()
+		_, _ = b.editStatusSafe(status, text)
+		progressMu.Unlock()
+	}
+
 	indices := make(chan int, numWorkers)
 	go func() {
 		defer close(indices)
@@ -221,7 +249,6 @@ func (b *Bot) linkBatch(c *Context, n int) error {
 		}
 	}()
 
-	// Workers: each pulls indices and runs ingest → format → maybeShorten.
 	var wg sync.WaitGroup
 	for w := 0; w < numWorkers; w++ {
 		wg.Add(1)
@@ -241,12 +268,17 @@ func (b *Bot) linkBatch(c *Context, n int) error {
 					// Non-media messages in the range are expected; count as skipped
 					// so the failure count reflects only genuine ingestion errors.
 					results[i] = batchResult{index: i, skipped: true}
+					atomicProcessed.Add(1)
+					updateProgress()
 					continue
 				}
 				result := b.Ingester.Ingest(batchCtx, m)
 				if result.Err != nil {
 					b.Log.Warn("batch ingest failed", "error", result.Err)
 					results[i] = batchResult{index: i, failed: true}
+					atomicFailed.Add(1)
+					atomicProcessed.Add(1)
+					updateProgress()
 					continue
 				}
 				streamURL := b.Cfg.FileURL(result.File.Hash, result.File.FileName)
@@ -257,12 +289,13 @@ func (b *Bot) linkBatch(c *Context, n int) error {
 					text:      formatBatchLinkMessage(result.File, streamURL, downloadURL, result.Reused),
 					succeeded: true,
 				}
+				atomicProcessed.Add(1)
+				updateProgress()
 			}
 		}()
 	}
 	wg.Wait()
 
-	// Drain results in chronological order, flushing chunks.
 	for i := range results {
 		r := results[i]
 		if r.skipped {
@@ -318,7 +351,7 @@ func (b *Bot) handlePrivateMedia(m *telegram.NewMessage, isOwner, isAuthorized b
 		streamURL, downloadURL = b.maybeShortenRaw(streamURL, downloadURL)
 	}
 
-	text := formatLinkMessage(result.File, streamURL, downloadURL, result.Reused)
+	text := formatLinkMessage(result.File, streamURL, downloadURL, result.Reused, b.Cfg.FileTTLDays)
 	b.editStatusWithButtons(status, text, streamURL, downloadURL)
 
 	source := ingest.Source{Kind: "private", UserName: userName(m.Sender), UserID: m.SenderID()}
@@ -331,8 +364,7 @@ func (b *Bot) handlePrivateMedia(m *telegram.NewMessage, isOwner, isAuthorized b
 	}
 }
 
-// handleChannelAutoProcess edits a channel post to attach stream/download
-// buttons. The bot must be admin in the channel to receive the post at all;
+// The bot must be admin in the channel to receive the post at all;
 // we still verify admin status defensively.
 func (b *Bot) handleChannelAutoProcess(m *telegram.NewMessage) {
 	if !b.botIsAdminIn(m) {
@@ -374,8 +406,6 @@ func (b *Bot) handleChannelAutoProcess(m *telegram.NewMessage) {
 	}
 }
 
-// --- helpers ---
-
 // maybeShorten shortens URLs for non-owner, non-authorized users when the
 // shortener is configured. Returns the original URLs unchanged otherwise.
 func (b *Bot) maybeShorten(c *Context, streamURL, downloadURL string) (string, string) {
@@ -407,9 +437,7 @@ func (b *Bot) maybeShortenRaw(streamURL, downloadURL string) (string, string) {
 	return sStream, sDownload
 }
 
-// formatLinkMessage renders the user-facing reply for an ingested file
-// (single-file / private-media path — includes size and type).
-func formatLinkMessage(rec *store.FileRecord, streamURL, downloadURL string, reused bool) string {
+func formatLinkMessage(rec *store.FileRecord, streamURL, downloadURL string, reused bool, ttlDays int) string {
 	reuseTag := ""
 	if reused {
 		reuseTag = " " + theme.Recycle
@@ -417,11 +445,19 @@ func formatLinkMessage(rec *store.FileRecord, streamURL, downloadURL string, reu
 	return fmt.Sprintf(msgReady,
 		reuseTag,
 		html.EscapeString(rec.FileName),
-		rec.Size,
+		tgutil.FormatBytes(rec.Size),
 		html.EscapeString(rec.MimeType),
-		html.EscapeString(streamURL),
 		html.EscapeString(downloadURL),
+		html.EscapeString(streamURL),
+		fileExpiryNote(ttlDays),
 	)
+}
+
+func fileExpiryNote(ttlDays int) string {
+	if ttlDays <= 0 {
+		return msgFileExpiryNever
+	}
+	return fmt.Sprintf(msgFileExpiryDays, ttlDays)
 }
 
 // formatBatchLinkMessage renders a compact link message for the batch path,
@@ -434,12 +470,11 @@ func formatBatchLinkMessage(rec *store.FileRecord, streamURL, downloadURL string
 	return fmt.Sprintf(msgBatchReady,
 		reuseTag,
 		html.EscapeString(rec.FileName),
-		html.EscapeString(streamURL),
 		html.EscapeString(downloadURL),
+		html.EscapeString(streamURL),
 	)
 }
 
-// userHasStarted reports whether the user has ever /started the bot.
 func (b *Bot) userHasStarted(userID int64) bool {
 	ctx, cancel := context.WithTimeout(b.baseCtx, 10*time.Second)
 	defer cancel()
@@ -451,14 +486,17 @@ func (b *Bot) userHasStarted(userID int64) bool {
 	return has
 }
 
-// sendPrivateLinksChecked DMs the user a copy of the links. Returns false
-// if the DM could not be delivered (user blocked the bot).
-func (b *Bot) sendPrivateLinksChecked(userID int64, rec *store.FileRecord, streamURL, downloadURL string, reused bool) bool {
+// Returns false if the DM could not be delivered (user blocked the bot).
+// Includes a "📬 From {chat_title}" prefix when chatTitle is non-empty.
+func (b *Bot) sendPrivateLinksChecked(userID int64, rec *store.FileRecord, streamURL, downloadURL string, reused bool, chatTitle string) bool {
 	primary := b.Pool.Primary()
 	if primary == nil || userID == 0 {
 		return false
 	}
-	text := formatLinkMessage(rec, streamURL, downloadURL, reused)
+	text := formatLinkMessage(rec, streamURL, downloadURL, reused, b.Cfg.FileTTLDays)
+	if chatTitle != "" {
+		text = fmt.Sprintf(msgDMSinglePrefix, html.EscapeString(chatTitle)) + text
+	}
 	_, err := primary.SendMessage(userID, text, &telegram.SendOptions{ParseMode: "HTML"})
 	if err != nil {
 		b.Log.Debug("could not DM user (likely blocked)", "user_id", userID, "error", err)
@@ -490,12 +528,11 @@ func (b *Bot) userStartedPrompt(m *telegram.NewMessage) {
 	botUsername := b.botUsername
 	opts := &telegram.SendOptions{ParseMode: "HTML"}
 	if botUsername != "" {
-		opts.ReplyMarkup = telegram.InlineURL(theme.Stream+" Start", "https://t.me/"+botUsername+"?start=link")
+		opts.ReplyMarkup = telegram.InlineURL(theme.Start+" Start", "https://t.me/"+botUsername+"?start=link")
 	}
 	_, _ = m.Respond(msgUsageLinkPrivate, opts)
 }
 
-// editStatusSafe edits the status message; logs on error.
 func (b *Bot) editStatusSafe(status *telegram.NewMessage, text string) (*telegram.NewMessage, error) {
 	if status == nil {
 		return nil, nil
@@ -508,8 +545,6 @@ func (b *Bot) editStatusSafe(status *telegram.NewMessage, text string) (*telegra
 	return primary.EditMessage(status.ChatID(), status.ID, text, &telegram.SendOptions{ParseMode: "HTML"})
 }
 
-// editStatusWithButtons edits the status message and attaches Stream + Download
-// inline URL buttons.
 func (b *Bot) editStatusWithButtons(status *telegram.NewMessage, text, streamURL, downloadURL string) {
 	if status == nil {
 		return

@@ -57,7 +57,6 @@ type Ingester struct {
 	dedupMu   map[string]*sync.Mutex
 }
 
-// New returns an Ingester.
 func New(p *pool.Pool, s *store.Store, vaultChannelID int64, log *slog.Logger) *Ingester {
 	return &Ingester{
 		pool:    p,
@@ -68,13 +67,11 @@ func New(p *pool.Pool, s *store.Store, vaultChannelID int64, log *slog.Logger) *
 	}
 }
 
-// VaultChannelID returns the ID of the vault channel. Used by the stream
-// handler to fetch vault messages via any client in the pool.
+// VaultChannelID returns the vault channel ID used by the stream handler.
 func (in *Ingester) VaultChannelID() int64 { return in.vaultID }
 
-// CleanupDedupMu removes dedup mutex entries that are not currently locked.
-// The DB unique index on file_key still prevents duplicate records if a
-// concurrent ingest raced against cleanup.
+// CleanupDedupMu evicts unlocked dedup mutex entries. The DB unique index on
+// file_key prevents duplicates if a concurrent ingest races against cleanup.
 func (in *Ingester) CleanupDedupMu() {
 	in.dedupMuMu.Lock()
 	defer in.dedupMuMu.Unlock()
@@ -86,8 +83,7 @@ func (in *Ingester) CleanupDedupMu() {
 	}
 }
 
-// StartDedupCleanup launches a background goroutine that periodically removes
-// unlocked entries from the dedup mutex map. Returns a stop function.
+// StartDedupCleanup runs periodic dedup mutex cleanup. Returns a stop function.
 func (in *Ingester) StartDedupCleanup(interval time.Duration) (stop func()) {
 	if interval <= 0 {
 		interval = 10 * time.Minute
@@ -109,7 +105,6 @@ func (in *Ingester) StartDedupCleanup(interval time.Duration) (stop func()) {
 	return func() { once.Do(func() { close(done) }) }
 }
 
-// fileMutex returns the per-file-key mutex, creating it if necessary.
 func (in *Ingester) fileMutex(key string) *sync.Mutex {
 	in.dedupMuMu.Lock()
 	defer in.dedupMuMu.Unlock()
@@ -127,9 +122,8 @@ func (in *Ingester) fileMutex(key string) *sync.Mutex {
 	return m
 }
 
-// vaultPeerResolved returns the cached InputPeer for the vault channel,
-// resolving it on first use. On failure the cache is invalidated and a
-// single retry is attempted before surfacing the error.
+// vaultPeerResolved returns the cached vault InputPeer, resolving on first
+// use. Cache is invalidated on failure; one retry before surfacing error.
 func (in *Ingester) vaultPeerResolved(ctx context.Context) (telegram.InputPeer, error) {
 	in.vaultPeerMu.RLock()
 	if in.vaultPeer != nil {
@@ -162,9 +156,8 @@ func (in *Ingester) vaultPeerResolved(ctx context.Context) (telegram.InputPeer, 
 	return peer, nil
 }
 
-// Ingest processes one media message: forwards it to the vault, inserts a DB
-// record, and returns the result. On a dedup hit it returns the existing
-// record with Reused=true. The caller posts the user reply + vault log.
+// Ingest forwards media to the vault, inserts a DB record, returns the result.
+// On a dedup hit it returns the existing record with Reused=true.
 func (in *Ingester) Ingest(ctx context.Context, msg *telegram.NewMessage) Result {
 	if msg == nil || !msg.IsMedia() {
 		return Result{Err: errors.New("message has no media")}
@@ -181,11 +174,10 @@ func (in *Ingester) Ingest(ctx context.Context, msg *telegram.NewMessage) Result
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Fast path: file already in vault.
 	if existing, err := in.store.FindFileByKey(ctx, key); err != nil {
 		return Result{Err: fmt.Errorf("checking existing file: %w", err)}
 	} else if existing != nil {
-		// Dedup hit — increment reuse count (best-effort, non-blocking).
+		// Best-effort reuse-count bump; non-blocking.
 		if incErr := in.store.IncrementReuseCount(ctx, key); incErr != nil {
 			in.log.Debug("incrementing reuse count", "file_key", key, "error", incErr)
 		}
@@ -193,7 +185,6 @@ func (in *Ingester) Ingest(ctx context.Context, msg *telegram.NewMessage) Result
 		return Result{File: existing, Reused: true}
 	}
 
-	// Slow path: ingest into vault.
 	primary := in.pool.Primary()
 	if primary == nil {
 		return Result{Err: errors.New("no primary client available")}
@@ -215,23 +206,25 @@ func (in *Ingester) Ingest(ctx context.Context, msg *telegram.NewMessage) Result
 		return Result{Err: fmt.Errorf("acquiring ingest lock: %w", err)}
 	}
 	if !locked {
-		// Another process is ingesting this file. Wait briefly and re-check: it
-		// may have finished, in which case we reuse its record.
-		select {
-		case <-time.After(2 * time.Second):
-		case <-ctx.Done():
-			return Result{Err: ctx.Err()}
-		}
-		if existing, _ := in.store.FindFileByKey(ctx, key); existing != nil {
-			if incErr := in.store.IncrementReuseCount(ctx, key); incErr != nil {
-				in.log.Debug("incrementing reuse count (after lock wait)", "file_key", key, "error", incErr)
+		for attempt := 0; attempt < 2; attempt++ {
+			select {
+			case <-time.After(2 * time.Second):
+			case <-ctx.Done():
+				return Result{Err: ctx.Err()}
 			}
-			return Result{File: existing, Reused: true}
-		}
-		// Still not there — try to acquire the lock once more.
-		locked, err = in.store.AcquireIngestLock(ctx, key, 60*time.Second)
-		if err != nil {
-			return Result{Err: fmt.Errorf("re-acquiring ingest lock: %w", err)}
+			if existing, _ := in.store.FindFileByKey(ctx, key); existing != nil {
+				if incErr := in.store.IncrementReuseCount(ctx, key); incErr != nil {
+					in.log.Debug("incrementing reuse count (after lock wait)", "file_key", key, "error", incErr)
+				}
+				return Result{File: existing, Reused: true}
+			}
+			locked, err = in.store.AcquireIngestLock(ctx, key, 60*time.Second)
+			if err != nil {
+				return Result{Err: fmt.Errorf("re-acquiring ingest lock: %w", err)}
+			}
+			if locked {
+				break
+			}
 		}
 		if !locked {
 			return Result{Err: errors.New("could not acquire ingest lock after retry")}
@@ -281,8 +274,6 @@ forwardLoop:
 				break forwardLoop
 			}
 			fwdErr = fwd.err
-			// Don't retry on FLOOD_WAIT — the pool's FloodHandler already
-			// slept + retried inside Forward; bail to surface the error.
 			var rpcErr *gogram.ErrResponseCode
 			if fwd.err != nil && errors.As(fwd.err, &rpcErr) && strings.HasPrefix(rpcErr.Message, "FLOOD_WAIT") {
 				break forwardLoop
@@ -298,8 +289,7 @@ forwardLoop:
 		return Result{Err: errors.New("forwarding returned no messages after retries")}
 	}
 
-	// Source provenance: record where we first saw the file. m.ChatID()
-	// returns 0 for private chats on some gogram paths; omitempty skips it.
+	// ChatID may return 0 for private chats on some gogram paths.
 	firstSourceChatID := msg.ChatID()
 	firstSourceMsgID := msg.ID
 
@@ -321,13 +311,11 @@ forwardLoop:
 		FirstSourceMsgID:  firstSourceMsgID,
 	}
 	if err := in.store.InsertFile(ctx, *rec); err != nil {
-		// Re-read BEFORE deleting the vault message. The insert may have committed
-		// while a transient error surfaced — deleting would leave a dangling record
-		// whose VaultMsgID points at a now-deleted message.
+		// Re-read before deleting: the insert may have committed despite a
+		// transient error — deleting would orphan the record.
 		existing, lookupErr := in.store.FindFileByKey(ctx, key)
 		if lookupErr == nil && existing != nil && existing.VaultMsgID != vaultMsgID {
-			// Lost the race: another ingester's record is canonical. Our
-			// vault message is a true orphan and must be cleaned up.
+			// Another ingester's record is canonical; our vault message is an orphan.
 			in.log.Warn("file record insert collided; reusing existing",
 				"file_key", key, "our_vault_msg_id", vaultMsgID, "existing_vault_msg_id", existing.VaultMsgID)
 			if _, delErr := primary.DeleteMessages(vaultPeer, []int32{vaultMsgID}); delErr != nil {
@@ -337,12 +325,12 @@ forwardLoop:
 			return Result{File: existing, Reused: true}
 		}
 		if lookupErr == nil && existing != nil && existing.VaultMsgID == vaultMsgID {
-			// Our insert actually committed — the error was a transient response-path failure.
+			// Error was a transient response-path failure; the insert committed.
 			in.log.Warn("file record insert reported error but row is present; treating as committed",
 				"file_key", key, "vault_msg_id", vaultMsgID, "insert_error", err)
 			return Result{File: existing, Reused: false}
 		}
-		// Genuinely failed: no record exists. Clean up the vault message so it doesn't leak.
+		// Genuine failure — no record exists, delete the orphan vault message.
 		if _, delErr := primary.DeleteMessages(vaultPeer, []int32{vaultMsgID}); delErr != nil {
 			in.log.Warn("failed to delete orphaned vault message",
 				"vault_msg_id", vaultMsgID, "error", delErr)
@@ -360,8 +348,7 @@ forwardLoop:
 	return Result{File: rec, Reused: false}
 }
 
-// PostVaultLog posts a log message to the vault channel as a reply to the
-// vault message that holds the file. Records who sent the file + stream/download links.
+// PostVaultLog posts a log reply to the stored vault message. Format mirrors msgReady.
 func (in *Ingester) PostVaultLog(ctx context.Context, rec *store.FileRecord, source Source, streamURL, downloadURL string) error {
 	primary := in.pool.Primary()
 	if primary == nil {
@@ -371,17 +358,30 @@ func (in *Ingester) PostVaultLog(ctx context.Context, rec *store.FileRecord, sou
 	if err != nil {
 		return err
 	}
+
+	sourceInfo := source.UserName
+	if sourceInfo == "" {
+		sourceInfo = fmt.Sprintf("User %d", source.UserID)
+	}
+	if source.ChatTitle != "" {
+		sourceInfo = fmt.Sprintf("%s in %s", sourceInfo, source.ChatTitle)
+	}
+
 	text := fmt.Sprintf(
-		"📦 <b>Ingest log</b>\n\n"+
-			"<b>Source:</b> %s\n"+
-			"<b>File:</b> %s (%d bytes)\n"+
-			"<b>Stream:</b> %s\n"+
-			"<b>Download:</b> %s",
-		html.EscapeString(source.String()),
+		"<blockquote>👤 <b>Source:</b> <a href=\"tg://user?id=%d\">%s</a>\n🆔 <b>User ID:</b> <code>%d</code></blockquote>\n\n"+
+			"<blockquote><code>%s</code></blockquote>\n\n"+
+			"📂 <b>File Size:</b> <code>%s</code>\n"+
+			"📎 <b>Type:</b> <code>%s</code>\n\n"+
+			"🚀 <b>Download Link:</b>\n<code>%s</code>\n\n"+
+			"🖥️ <b>Stream Link:</b>\n<code>%s</code>",
+		source.UserID,
+		html.EscapeString(sourceInfo),
+		source.UserID,
 		html.EscapeString(rec.FileName),
-		rec.Size,
-		html.EscapeString(streamURL),
+		tgutil.FormatBytes(rec.Size),
+		html.EscapeString(rec.MimeType),
 		html.EscapeString(downloadURL),
+		html.EscapeString(streamURL),
 	)
 	opts := &telegram.SendOptions{
 		ParseMode: "HTML",
@@ -402,7 +402,6 @@ type Source struct {
 
 func (s Source) String() string {
 	out := s.Kind
-	// Only prepend separator + label when non-empty (avoids double spaces).
 	if s.UserName != "" {
 		out += " from " + s.UserName
 		if s.UserID != 0 {

@@ -29,12 +29,12 @@ import (
 func (b *Bot) handleBan(c *Context) error {
 	parts := strings.Fields(c.Args)
 	if len(parts) == 0 {
-		_, _ = c.ReplyFormatted("Usage: <code>/ban &lt;user_id&gt; [reason]</code>")
+		_, _ = c.ReplyFormatted(msgUsageBan)
 		return nil
 	}
 	id, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
-		_, _ = c.ReplyFormatted("❌ Invalid ID. Must be an integer.")
+		_, _ = c.ReplyFormatted(msgErrInvalidIDInt)
 		return nil
 	}
 	if id == c.Msg.SenderID() {
@@ -62,7 +62,7 @@ func (b *Bot) handleBan(c *Context) error {
 			BannedAt:  now,
 			Reason:    reason,
 		}); err != nil {
-			_, _ = c.ReplyFormatted("❌ " + html.EscapeString(err.Error())) // best-effort reply
+			_, _ = c.ReplyFormatted(fmt.Sprintf(msgErrDBOperation, html.EscapeString(err.Error())))
 			return nil
 		}
 		// Best-effort: leave the channel.
@@ -71,7 +71,11 @@ func (b *Bot) handleBan(c *Context) error {
 		} else {
 			b.Log.Warn("ban: no primary client to leave channel")
 		}
-		_, _ = c.ReplyFormatted(fmt.Sprintf(msgBannedChannel, id))
+		reasonSuffix := ""
+		if reason != "" {
+			reasonSuffix = fmt.Sprintf(msgBannedReasonSuffix, html.EscapeString(reason))
+		}
+		_, _ = c.ReplyFormatted(fmt.Sprintf(msgBannedChannel, id, reasonSuffix))
 		return nil
 	}
 
@@ -81,7 +85,7 @@ func (b *Bot) handleBan(c *Context) error {
 		BannedAt: now,
 		Reason:   reason,
 	}); err != nil {
-		_, _ = c.ReplyFormatted("❌ " + html.EscapeString(err.Error())) // best-effort reply
+		_, _ = c.ReplyFormatted(fmt.Sprintf(msgErrDBOperation, html.EscapeString(err.Error())))
 		return nil
 	}
 	// Notify the banned user (best-effort).
@@ -94,7 +98,11 @@ func (b *Bot) handleBan(c *Context) error {
 	} else {
 		b.Log.Warn("ban: no primary client to notify user")
 	}
-	_, _ = c.ReplyFormatted(fmt.Sprintf(msgBannedUser, id))
+	reasonSuffix := ""
+	if reason != "" {
+		reasonSuffix = fmt.Sprintf(msgBannedReasonSuffix, html.EscapeString(reason))
+	}
+	_, _ = c.ReplyFormatted(fmt.Sprintf(msgBannedUser, id, reasonSuffix))
 	return nil
 }
 
@@ -102,26 +110,26 @@ func (b *Bot) handleBan(c *Context) error {
 func (b *Bot) handleUnban(c *Context) error {
 	parts := strings.Fields(c.Args)
 	if len(parts) == 0 {
-		_, _ = c.ReplyFormatted("Usage: <code>/unban &lt;user_id&gt;</code>")
+		_, _ = c.ReplyFormatted(msgUsageUnban)
 		return nil
 	}
 	id, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
-		_, _ = c.ReplyFormatted("❌ Invalid ID.")
+		_, _ = c.ReplyFormatted(msgErrInvalidID)
 		return nil
 	}
 	dbCtx, dbCancel := context.WithTimeout(b.baseCtx, 30*time.Second)
 	defer dbCancel()
 	if id < 0 {
 		if err := b.Store.UnbanChannel(dbCtx, id); err != nil {
-			_, _ = c.ReplyFormatted("❌ " + html.EscapeString(err.Error())) // best-effort reply
+			_, _ = c.ReplyFormatted(fmt.Sprintf(msgErrDBOperation, html.EscapeString(err.Error())))
 			return nil
 		}
 		_, _ = c.ReplyFormatted(fmt.Sprintf(msgUnbannedChannel, id))
 		return nil
 	}
 	if err := b.Store.UnbanUser(dbCtx, id); err != nil {
-		_, _ = c.ReplyFormatted("❌ " + html.EscapeString(err.Error())) // best-effort reply
+		_, _ = c.ReplyFormatted(fmt.Sprintf(msgErrDBOperation, html.EscapeString(err.Error())))
 		return nil
 	}
 	if primary := b.Pool.Primary(); primary != nil {
@@ -133,15 +141,8 @@ func (b *Bot) handleUnban(c *Context) error {
 	return nil
 }
 
-// handleBroadcast /broadcast (reply to a message). Copies the replied-to
-// message to every user who has started the bot, posting a status message
-// with a Cancel button at the start and a summary at the end.
-//
-// Modes: "all" (default), "authorized", "regular" (all EXCEPT authorized).
-// 4 workers send concurrently (200ms apart). Transient errors retry 3× with
-// exponential backoff; permanent errors (USER_IS_BLOCKED, PEER_ID_INVALID,
-// USER_DEACTIVATED, CHAT_WRITE_FORBIDDEN, FLOOD_WAIT) are not retried.
-// Unreachable users are pruned from the DB in the background.
+// handleBroadcast /broadcast (reply to a message). Modes: all/authorized/regular;
+// retries transient errors 3×, prunes unreachable users in the background.
 func (b *Bot) handleBroadcast(c *Context) error {
 	if !c.Msg.IsReply() {
 		_, _ = c.ReplyFormatted(msgBroadcastUsage)
@@ -153,7 +154,6 @@ func (b *Bot) handleBroadcast(c *Context) error {
 		return nil
 	}
 
-	// Parse broadcast mode.
 	mode := "all"
 	if c.Args != "" {
 		mode = strings.TrimSpace(strings.ToLower(c.Args))
@@ -163,10 +163,8 @@ func (b *Bot) handleBroadcast(c *Context) error {
 		}
 	}
 
-	// Authorized-mode filtering: use IsAuthorized per user during streaming
-	// (cached by store) instead of materializing the entire auth list in memory.
+	// Authorized-mode: check IsAuthorized per-user during streaming, not in bulk.
 
-	// Post the initial status with a Cancel button.
 	kb := telegram.NewKeyboard().
 		AddRow(telegram.Button.Data(theme.Cancel+" Cancel", "broadcast_cancel")).
 		Build()
@@ -184,6 +182,8 @@ func (b *Bot) handleBroadcast(c *Context) error {
 	b.registerBroadcastCancel(status.ID, cancel)
 	defer b.unregisterBroadcastCancel(status.ID)
 
+	broadcastStart := time.Now()
+
 	// 4 workers; each sleeps 200ms between sends to avoid flood-waits.
 	const numWorkers = 4
 	const sendDelay = 200 * time.Millisecond
@@ -196,12 +196,11 @@ func (b *Bot) handleBroadcast(c *Context) error {
 	userCh := make(chan store.User, numWorkers*2)
 	resCh := make(chan result, numWorkers*2)
 
-	// totalUsers counts every streamed user; atomic (shared with producer).
+	// totalUsers is atomic; shared with producer.
 	var totalUsers atomic.Int64
 
-	// Producer: stream users from the DB via a cursor (bounded memory).
-	// listCtx has no timeout (large broadcasts can take minutes); the
-	// producer short-circuits on Cancel-button context.
+	// Stream users via cursor (bounded memory). listCtx has no timeout (large
+	// broadcasts can take minutes); short-circuits on Cancel-button context.
 	listCtx, listCancel := context.WithCancel(context.Background())
 	defer listCancel()
 	go func() {
@@ -240,7 +239,6 @@ func (b *Bot) handleBroadcast(c *Context) error {
 		}
 	}()
 
-	// Workers: pull from userCh, send, report the result.
 	var wg sync.WaitGroup
 	for w := 0; w < numWorkers; w++ {
 		wg.Add(1)
@@ -260,8 +258,7 @@ func (b *Bot) handleBroadcast(c *Context) error {
 				if broadcastCtx.Err() != nil {
 					return
 				}
-				// 3-retry on transient errors with exponential backoff.
-				// Permanent errors and FLOOD_WAIT are NOT retried.
+				// Retry transient errors 3× with exponential backoff.
 				var sendErr error
 				var unreachable bool
 				for attempt := 0; attempt < 3; attempt++ {
@@ -283,12 +280,10 @@ func (b *Bot) handleBroadcast(c *Context) error {
 						unreachable = true
 						break
 					}
-					// FLOOD_WAIT is handled by the pool's FloodHandler; if it
-					// reaches us, the handler gave up (wait > 600s) — don't retry.
+					// FLOOD_WAIT: pool's FloodHandler already gave up — don't retry.
 					if telegram.MatchError(sendErr, "FLOOD_WAIT") {
 						break
 					}
-					// Other errors (network, timeout) — retry.
 				}
 				if sendErr == nil {
 					resCh <- result{ok: true}
@@ -306,13 +301,11 @@ func (b *Bot) handleBroadcast(c *Context) error {
 		}()
 	}
 
-	// Collector: wait for workers, then close resCh.
 	go func() {
 		wg.Wait()
 		close(resCh)
 	}()
 
-	// Track unreachable users for pruning.
 	succeeded, failed, unreachable := 0, 0, 0
 	var unreachableUsers []int64
 	for r := range resCh {
@@ -351,16 +344,22 @@ func (b *Bot) handleBroadcast(c *Context) error {
 
 	total := int(totalUsers.Load())
 	cancelled := succeeded+failed+unreachable < total
-	summary := fmt.Sprintf(msgBroadcastComplete, modeLabel, succeeded, failed, unreachable, total)
+	elapsed := formatReadableDuration(time.Since(broadcastStart))
+	var summary string
 	if cancelled {
-		summary = fmt.Sprintf(msgBroadcastCancelled, modeLabel, succeeded, failed, unreachable, total)
+		summary = fmt.Sprintf(msgBroadcastCancelled, elapsed, modeLabel, total, succeeded, failed, unreachable)
+	} else {
+		summary = fmt.Sprintf(msgBroadcastComplete, elapsed, modeLabel, total, succeeded, failed, unreachable)
 	}
-	// Clear the Cancel button.
 	if primary := b.Pool.Primary(); primary != nil {
-		_, _ = primary.EditMessage(status.ChatID(), status.ID, summary, &telegram.SendOptions{
-			ParseMode:   "HTML",
-			ReplyMarkup: telegram.NewKeyboard().Build(),
+		_, editErr := primary.EditMessage(status.ChatID(), status.ID, summary, &telegram.SendOptions{
+			ParseMode: "HTML",
+			// nil clears the Cancel button; empty keyboard triggers REPLY_MARKUP_INVALID.
 		})
+		if editErr != nil {
+			b.Log.Warn("broadcast: could not edit status to summary; sending as new message", "error", editErr)
+			_, _ = c.Msg.Respond(summary, &telegram.SendOptions{ParseMode: "HTML"})
+		}
 	} else {
 		b.Log.Warn("broadcast summary: no primary client")
 	}
@@ -372,18 +371,17 @@ func (b *Bot) handleBroadcast(c *Context) error {
 func (b *Bot) handleAuthorize(c *Context) error {
 	parts := strings.Fields(c.Args)
 	if len(parts) == 0 {
-		_, _ = c.ReplyFormatted("Usage: <code>/authorize &lt;user_id&gt;</code>")
+		_, _ = c.ReplyFormatted(msgUsageAuthorize)
 		return nil
 	}
 	id, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
-		_, _ = c.ReplyFormatted("❌ Invalid ID.")
+		_, _ = c.ReplyFormatted(msgErrInvalidID)
 		return nil
 	}
-	// Verify the user exists before authorizing.
 	primary := b.Pool.Primary()
 	if primary == nil {
-		_, _ = c.ReplyFormatted("❌ Bot client is not ready. Please try again later.")
+		_, _ = c.ReplyFormatted(msgErrBotNotReady)
 		return nil
 	}
 	u, err := primary.GetUser(id)
@@ -400,7 +398,7 @@ func (b *Bot) handleAuthorize(c *Context) error {
 		AddedBy:   c.Msg.SenderID(),
 		AddedAt:   time.Now(),
 	}); err != nil {
-		_, _ = c.ReplyFormatted("❌ " + html.EscapeString(err.Error()))
+		_, _ = c.ReplyFormatted(fmt.Sprintf(msgErrDBOperation, html.EscapeString(err.Error())))
 		return nil
 	}
 	if b.Limiter != nil {
@@ -414,22 +412,21 @@ func (b *Bot) handleAuthorize(c *Context) error {
 func (b *Bot) handleDeauthorize(c *Context) error {
 	parts := strings.Fields(c.Args)
 	if len(parts) == 0 {
-		_, _ = c.ReplyFormatted("Usage: <code>/deauthorize &lt;user_id&gt;</code>")
+		_, _ = c.ReplyFormatted(msgUsageDeauthorize)
 		return nil
 	}
 	id, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
-		_, _ = c.ReplyFormatted("❌ Invalid ID.")
+		_, _ = c.ReplyFormatted(msgErrInvalidID)
 		return nil
 	}
 	dctx, dcancel := context.WithTimeout(b.baseCtx, 30*time.Second)
 	defer dcancel()
 	if err := b.Store.Deauthorize(dctx, id); err != nil {
-		_, _ = c.ReplyFormatted("❌ " + html.EscapeString(err.Error()))
+		_, _ = c.ReplyFormatted(fmt.Sprintf(msgErrDBOperation, html.EscapeString(err.Error())))
 		return nil
 	}
-	// Best-effort: revoke any active token-activation so a deauthorized
-	// user can't keep using the bot until their activation expires.
+	// Best-effort: revoke active token-activation so deauthorized users can't keep using the bot.
 	if b.Cfg.TokenEnabled {
 		if err := b.Store.InvalidateActivatedUser(dctx, id); err != nil {
 			b.Log.Debug("could not invalidate activated user", "user_id", id, "error", err)
@@ -445,41 +442,51 @@ func (b *Bot) handleListAuth(c *Context) error {
 	defer laCancel()
 	auths, err := b.Store.ListAuthorized(laCtx)
 	if err != nil {
-		_, _ = c.ReplyFormatted("❌ " + html.EscapeString(err.Error())) // best-effort reply
+		_, _ = c.ReplyFormatted(fmt.Sprintf(msgErrDBOperation, html.EscapeString(err.Error())))
 		return nil
 	}
 
-	// Build body lines once for consistent pagination.
-	lines := make([]string, 0, len(auths)+1)
-	for _, a := range auths {
+	var body strings.Builder
+	for i, a := range auths {
 		name := a.FirstName
 		if name == "" {
-			name = "(unknown)"
+			name = msgFallbackUnknownName
 		}
-		lines = append(lines, fmt.Sprintf("• <code>%d</code> — %s\n", a.UserID, html.EscapeString(name)))
+		authBy := strconv.FormatInt(a.AddedBy, 10)
+		authTime := a.AddedAt.Format("2006-01-02 15:04")
+		body.WriteString(fmt.Sprintf("<blockquote>%d. 👤 <b>Name:</b> %s\n🆔 <b>User ID:</b> <code>%d</code>\n🔑 <b>Authorized by:</b> <code>%s</code>\n📅 <b>Date:</b> <code>%s</code></blockquote>\n\n",
+			i+1, html.EscapeString(name), a.UserID, html.EscapeString(authBy), html.EscapeString(authTime)))
 	}
-	// Always include the owner implicitly.
-	lines = append(lines, fmt.Sprintf(msgAuthOwnerImplicit, b.Cfg.OwnerUserID))
+	body.WriteString(fmt.Sprintf(msgAuthOwnerImplicit, b.Cfg.OwnerUserID))
 
 	// Paginate at 3500 chars (headroom under Telegram's 4096-char cap);
 	// 1s delay between pages avoids flood-waits.
 	const pageMax = 3500
 	var pages []string
 	var cur strings.Builder
-	for _, line := range lines {
-		if cur.Len() > 0 && cur.Len()+len(line) > pageMax {
+	bodyStr := body.String()
+	entries := strings.Split(bodyStr, "\n\n")
+	for _, entry := range entries {
+		if cur.Len() > 0 && cur.Len()+len(entry)+2 > pageMax {
 			pages = append(pages, cur.String())
 			cur.Reset()
 		}
-		cur.WriteString(line)
+		if cur.Len() > 0 {
+			cur.WriteString("\n\n")
+		}
+		cur.WriteString(entry)
 	}
 	if cur.Len() > 0 || len(pages) == 0 {
 		pages = append(pages, cur.String())
 	}
 	total := len(pages)
-	for i, body := range pages {
-		header := fmt.Sprintf(msgAuthListHeader, len(auths), i+1, total) + "\n\n"
-		_, _ = c.ReplyFormatted(header + body)
+	for i, pageBody := range pages {
+		header := msgAuthListHeader
+		if total > 1 {
+			header += fmt.Sprintf("\n\n<blockquote>📄 <b>Page %d of %d</b> — %d user(s)</blockquote>", i+1, total, len(auths))
+		}
+		opts := &telegram.SendOptions{ParseMode: "HTML", ReplyMarkup: buildCloseMarkup()}
+		_, _ = c.Msg.Respond(header+"\n\n"+pageBody, opts)
 		if i < total-1 {
 			time.Sleep(1 * time.Second)
 		}
@@ -500,15 +507,17 @@ func (b *Bot) handleStatus(c *Context) error {
 		if i < len(all) && all[i] != nil {
 			dc = all[i].GetDC()
 		}
-		workload.WriteString(fmt.Sprintf("• bot_%02d — inflight %d, DC %d\n", i, n, dc))
+		workload.WriteString(fmt.Sprintf("🤖 <code>bot_%02d</code> — ⚡ inflight <b>%d</b>, 🌍 DC <code>%d</code>\n", i, n, dc))
 	}
-	_, _ = c.ReplyFormatted(fmt.Sprintf(msgBotStatus,
-		tghttp.Version,
-		html.EscapeString(botUsername),
+	text := fmt.Sprintf(msgBotStatus,
 		uptime,
+		html.EscapeString(botUsername),
+		tghttp.Version,
 		b.Pool.Len(),
 		b.Pool.TotalInflight(),
-		workload.String()))
+		workload.String())
+	opts := &telegram.SendOptions{ParseMode: "HTML", ReplyMarkup: buildCloseMarkup()}
+	_, _ = c.Msg.Respond(text, opts)
 	return nil
 }
 
@@ -518,18 +527,16 @@ func (b *Bot) handleUsers(c *Context) error {
 	defer ucCancel()
 	count, err := b.Store.CountUsers(ucCtx)
 	if err != nil {
-		_, _ = c.ReplyFormatted("❌ " + html.EscapeString(err.Error()))
+		_, _ = c.ReplyFormatted(fmt.Sprintf(msgErrDBOperation, html.EscapeString(err.Error())))
 		return nil
 	}
-	_, _ = c.ReplyFormatted(fmt.Sprintf(msgUserCount, count))
+	opts := &telegram.SendOptions{ParseMode: "HTML", ReplyMarkup: buildCloseMarkup()}
+	_, _ = c.Msg.Respond(fmt.Sprintf(msgUserCount, count), opts)
 	return nil
 }
 
-// handleLog /log. Sends the current log file as a document. If the log exceeds
-// 45 MiB (Telegram's bot upload limit is ~50 MiB), it's tailed to the last 45 MiB.
-//
-// The file is always copied through a temp file with sensitive patterns (bot
-// tokens, MongoDB credentials) redacted before sending.
+// handleLog /log. Sends the log tailed to 45 MiB (Telegram's 50 MiB cap),
+// with bot tokens and MongoDB credentials redacted via a temp file.
 func (b *Bot) handleLog(c *Context) error {
 	path := os.Getenv("TG_LOG_FILE")
 	if path == "" {
@@ -543,7 +550,6 @@ func (b *Bot) handleLog(c *Context) error {
 
 	caption := fmt.Sprintf(msgLogCaption, info.Size())
 
-	// Always copy bytes (potentially tailed) into a redacted temp file.
 	//gosec:disable G304 // path is TG_LOG_FILE env (operator-supplied), not user input; owner-only command
 	f, err := os.Open(path)
 	//gosec:enable G304
@@ -554,8 +560,7 @@ func (b *Bot) handleLog(c *Context) error {
 	}
 	defer f.Close()
 
-	// Telegram's bot API limits file uploads to 50 MiB. Tail to 45 MiB
-	// (leaving headroom) before reading.
+	// Telegram upload cap is 50 MiB; tail to 45 MiB for headroom.
 	const maxSendSize = 45 << 20 // 45 MiB
 	if info.Size() > maxSendSize {
 		if _, err := f.Seek(-maxSendSize, io.SeekEnd); err != nil {
@@ -596,8 +601,7 @@ func (b *Bot) handleLog(c *Context) error {
 		_, _ = c.ReplyFormatted(msgLogReadErr)
 		return nil
 	}
-	// Don't ignore sync errors — a failed sync could mean the redacted
-	// bytes never reached disk before SendMedia reads them.
+	// Sync errors mean redacted bytes may not reach disk before SendMedia reads them.
 	if err := tmp.Sync(); err != nil {
 		b.Log.Warn("sync log temp file failed", "error", err)
 	}
@@ -622,27 +626,22 @@ func (b *Bot) handleLog(c *Context) error {
 
 // redactBotTokenRe matches Telegram bot tokens: 8-10 digit bot ID, colon,
 // 35-character alphanumeric/underscore/hyphen secret.
-var redactBotTokenRe = regexp.MustCompile(`\d{8,10}:[A-Za-z0-9_-]{35}`)
+var redactBotTokenRe = regexp.MustCompile(`\d{8,10}:[A-Za-z0-9_-]{35,}`)
 
 // redactMongoURIRe matches MongoDB connection strings with embedded credentials.
 // Capture group 1 preserves the optional "+srv" suffix for the replacement.
 var redactMongoURIRe = regexp.MustCompile(`mongodb(\+srv)?://[^:]+:[^@]+@`)
 
-// redactLogSecrets masks bot tokens and MongoDB credentials in in.
+// redactLogSecrets masks bot tokens and MongoDB credentials in the input.
 func redactLogSecrets(in []byte) []byte {
 	out := redactBotTokenRe.ReplaceAll(in, []byte("[REDACTED_TOKEN]"))
 	out = redactMongoURIRe.ReplaceAll(out, []byte("mongodb$1://[REDACTED]:[REDACTED]@"))
 	return out
 }
 
-// handleRestart /restart. Posts "Restarting…", saves a restart marker, then in
-// a goroutine runs `git pull --ff-only`, rebuilds the running binary in place via
-// `go build`, and signals self with SIGTERM so the supervisor restarts with the
-// freshly-built binary.
-//
-// If git pull or go build fails, the status message is edited with the error
-// and the process is NOT signalled. On next startup, EditRestartMarkerIfPending
-// picks up the marker and edits the original "Restarting…" message to "Restart Successful".
+// handleRestart /restart. Runs git pull --ff-only && go build in a goroutine,
+// then signals self (SIGTERM) for supervisor restart. On failure, edits the
+// status message with the error; on next startup, marker → "Restart Successful".
 func (b *Bot) handleRestart(c *Context) error {
 	status, _ := c.Reply(msgRestarting)
 	if status == nil {
@@ -668,8 +667,10 @@ func (b *Bot) handleRestart(c *Context) error {
 			repo = "https://github.com/fyaz05/ThunderGo.git"
 		}
 		branch := b.Cfg.UpstreamBranch
+		if branch == "" {
+			branch = "main"
+		}
 
-		// 1. git pull — fast-forward to the tracked branch.
 		gitCtx, gitCancel := context.WithTimeout(b.baseCtx, 2*time.Minute)
 		defer gitCancel()
 		cwd, err := os.Getwd()
@@ -680,7 +681,7 @@ func (b *Bot) handleRestart(c *Context) error {
 
 		var gitRemote, gitBranch string
 		if repo != "" {
-			// If UPSTREAM_REPO is not the current origin, replace it.
+			// Replace origin if UPSTREAM_REPO differs.
 			// #nosec G204 — admin-only, cwd is from os.Getwd()
 			checkRemote := exec.CommandContext(gitCtx, "git", "-C", cwd, "remote", "get-url", "origin")
 			remoteBytes, err := checkRemote.Output()
@@ -711,7 +712,6 @@ func (b *Bot) handleRestart(c *Context) error {
 		}
 		b.Log.Info("restart: git pull complete", "remote", gitRemote, "branch", gitBranch)
 
-		// 2. go mod verify — check module integrity before building.
 		modCtx, modCancel := context.WithTimeout(b.baseCtx, 2*time.Minute)
 		defer modCancel()
 		modCmd := exec.CommandContext(modCtx, "go", "mod", "verify")
@@ -723,9 +723,7 @@ func (b *Bot) handleRestart(c *Context) error {
 			return
 		}
 
-		// 3. go build — rebuild the running binary in place. On Linux the
-		// kernel keeps the old inode open for the running process, so
-		// overwriting is safe; the new inode is used on the next exec.
+		// Rebuild in place: the kernel keeps the old inode open, so overwriting is safe.
 		buildCtx, buildCancel := context.WithTimeout(b.baseCtx, 5*time.Minute)
 		defer buildCancel()
 		binaryPath, err := os.Executable()
@@ -744,14 +742,8 @@ func (b *Bot) handleRestart(c *Context) error {
 		}
 		b.Log.Info("restart: go build complete")
 
-		// 4. Signal self for graceful shutdown. The supervisor restarts the
-		// process with the freshly-built binary; on next startup the restart
-		// marker is edited to "Restart Successful".
-		//
-		// On platforms where SIGTERM isn't supported (notably Windows), fall
-		// back to os.Interrupt (SIGINT) which triggers the same signal handler.
-		// If both signal deliveries fail, call b.Stop() then os.Exit(1) so the
-		// supervisor restarts the process.
+		// Signal self for graceful shutdown (SIGTERM; falls back to os.Interrupt on
+		// Windows). If both fail, call b.Stop() then os.Exit(1) to trigger restart.
 		b.Log.Info("restart requested; signalling self for graceful shutdown")
 		p, _ := os.FindProcess(os.Getpid())
 		if err := p.Signal(syscall.SIGTERM); err != nil {

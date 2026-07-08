@@ -27,7 +27,6 @@ import (
 	"github.com/fyaz05/ThunderGo/internal/tgutil"
 )
 
-// Bot is the running bot instance.
 type Bot struct {
 	Cfg           *config.Config
 	Pool          *pool.Pool
@@ -46,17 +45,14 @@ type Bot struct {
 	broadcastCancelMu sync.Mutex
 	broadcastCancels  map[int32]context.CancelFunc
 
-	// Cached at startup.
 	botUserID   int64
 	botUsername string
 
-	// Cached at startup.
 	forceSubLink  string
 	forceSubTitle string
 
 	startTime time.Time
 
-	// sem bounds concurrent handler goroutines.
 	sem chan struct{}
 
 	// handlerWg tracks in-flight dispatchAsync goroutines so Stop() can drain.
@@ -70,8 +66,7 @@ type Bot struct {
 	baseCtxCancel context.CancelFunc
 }
 
-// Command describes a single bot command. OwnerOnly commands are silently
-// ignored when invoked by a non-owner.
+// OwnerOnly commands are silently ignored when invoked by a non-owner.
 type Command struct {
 	Name        string
 	Description string
@@ -79,7 +74,6 @@ type Command struct {
 	Handler     func(c *Context) error
 }
 
-// Context is passed to every command handler.
 type Context struct {
 	Bot          *Bot
 	Cmd          *Command
@@ -94,7 +88,6 @@ func (c *Context) Reply(text string) (*telegram.NewMessage, error) {
 	return c.Msg.Reply(text, &telegram.SendOptions{ParseMode: "HTML"})
 }
 
-// ReplyFormatted is an alias for Reply.
 func (c *Context) ReplyFormatted(text string) (*telegram.NewMessage, error) {
 	return c.Reply(text)
 }
@@ -104,7 +97,7 @@ func (c *Context) Respond(text string) (*telegram.NewMessage, error) {
 	return c.Msg.Respond(text, &telegram.SendOptions{ParseMode: "HTML"})
 }
 
-// New constructs a Bot. The caller must invoke Start to connect.
+// The caller must invoke Start to connect.
 func New(cfg *config.Config, p *pool.Pool, s *store.Store, in *ingest.Ingester, sh *shortener.Shortener, lim *ratelimit.Limiter, log *slog.Logger) *Bot {
 	b := &Bot{
 		Cfg:       cfg,
@@ -126,7 +119,6 @@ func New(cfg *config.Config, p *pool.Pool, s *store.Store, in *ingest.Ingester, 
 	return b
 }
 
-// Register adds a command to the dispatcher.
 func (b *Bot) Register(cmd *Command) {
 	if err := validateCommandName(cmd.Name); err != nil {
 		b.Log.Error("refusing to register command with invalid name", "name", cmd.Name, "error", err)
@@ -137,9 +129,7 @@ func (b *Bot) Register(cmd *Command) {
 	b.commands[cmd.Name] = cmd
 }
 
-// Start connects the primary client, registers handlers, and registers the
-// bot command list with Telegram. GetMe failure is fatal: admin detection and
-// DM features depend on it.
+// GetMe failure is fatal: admin detection and DM features depend on it.
 func (b *Bot) Start(ctx context.Context) error {
 	primary := b.Pool.Primary()
 	if primary == nil {
@@ -179,6 +169,7 @@ func (b *Bot) Start(ctx context.Context) error {
 	b.primary.OnCallback("help", b.handleHelpCallback)
 	b.primary.OnCallback("about", b.handleAboutCallback)
 	b.primary.OnCallback("close", b.handleCloseCallback)
+	b.primary.OnCallback(string(telegram.OnCallbackQuery), b.handleUnsupportedCallback)
 
 	if err := b.registerCommandList(ctx); err != nil {
 		b.Log.Warn("failed to register bot commands with Telegram", "error", err)
@@ -196,28 +187,25 @@ func (b *Bot) Start(ctx context.Context) error {
 	return nil
 }
 
-// registerBroadcastCancel associates a broadcast's cancel func with its status message ID.
 func (b *Bot) registerBroadcastCancel(msgID int32, cancel context.CancelFunc) {
 	b.broadcastCancelMu.Lock()
 	defer b.broadcastCancelMu.Unlock()
 	b.broadcastCancels[msgID] = cancel
 }
 
-// unregisterBroadcastCancel removes a broadcast's cancel func after it completes.
 func (b *Bot) unregisterBroadcastCancel(msgID int32) {
 	b.broadcastCancelMu.Lock()
 	defer b.broadcastCancelMu.Unlock()
 	delete(b.broadcastCancels, msgID)
 }
 
-// handleBroadcastCancel is the callback handler for the "broadcast_cancel"
-// inline button. Owner-only.
+// Owner-only.
 func (b *Bot) handleBroadcastCancel(cq *telegram.CallbackQuery) error {
 	if cq == nil {
 		return nil
 	}
 	if !b.Cfg.IsOwner(cq.SenderID) {
-		_, _ = cq.Answer("Only the owner can cancel a broadcast.", &telegram.CallbackOptions{Alert: true})
+		_, _ = cq.Answer(msgCallbackBroadcastCancelDenied, &telegram.CallbackOptions{Alert: true})
 		return nil
 	}
 	msgID := cq.MessageID
@@ -225,11 +213,11 @@ func (b *Bot) handleBroadcastCancel(cq *telegram.CallbackQuery) error {
 	cancel, ok := b.broadcastCancels[msgID]
 	b.broadcastCancelMu.Unlock()
 	if !ok {
-		_, _ = cq.Answer("No active broadcast found for this message.", &telegram.CallbackOptions{Alert: true})
+		_, _ = cq.Answer(msgCallbackBroadcastNotFound, &telegram.CallbackOptions{Alert: true})
 		return nil
 	}
 	cancel()
-	_, _ = cq.Answer("Broadcast cancelled.", nil)
+	_, _ = cq.Answer(msgCallbackBroadcastCancelled)
 	return nil
 }
 
@@ -263,8 +251,7 @@ func (b *Bot) registerCommandList(ctx context.Context) error {
 	return err
 }
 
-// dispatch is the single entry point for all incoming messages. After Stop(),
-// new messages are silently dropped.
+// After Stop(), new messages are silently dropped.
 func (b *Bot) dispatch(m *telegram.NewMessage) error {
 	// Add to WaitGroup BEFORE the stopCh check so Stop()'s Wait() can't return
 	// before this goroutine is launched.
@@ -297,8 +284,7 @@ func (b *Bot) dispatchAsync(m *telegram.NewMessage) {
 		}
 	}()
 
-	// Ignore messages from banned channels and supergroups. IsChannel() covers
-	// broadcast channels; IsGroup() covers supergroups.
+	// IsChannel() covers broadcast channels; IsGroup() covers supergroups.
 	if m.IsChannel() || m.IsGroup() {
 		channelID := m.ChannelID()
 		if channelID == 0 {
@@ -345,10 +331,9 @@ func (b *Bot) dispatchAsync(m *telegram.NewMessage) {
 		cmd, ok := b.commands[cmdName]
 		b.mu.RUnlock()
 		if !ok {
-			return // Unknown command — silently ignore.
+			return
 		}
 
-		// Owner-only gate: non-owners get no response.
 		if cmd.OwnerOnly && !isOwner {
 			return
 		}
@@ -362,7 +347,6 @@ func (b *Bot) dispatchAsync(m *telegram.NewMessage) {
 			IsAuthorized: isAuthorized,
 		}
 
-		// Owner bypasses preflight.
 		if !isOwner {
 			if stop, err := b.preflight(ctx); stop {
 				if err != nil {
@@ -394,8 +378,7 @@ func (b *Bot) dispatchAsync(m *telegram.NewMessage) {
 		return
 	}
 
-	// Channel auto-processing. m.IsChannel() is true only for broadcast channels
-	// (not supergroups); IsChannelPost() only matches forwarded posts.
+	// m.IsChannel() is true only for broadcast channels (not supergroups); IsChannelPost() only matches forwarded posts.
 	if m.IsChannel() && b.Cfg.ChannelAutoProcess && m.IsMedia() {
 		b.handleChannelAutoProcess(m)
 		return
@@ -464,7 +447,7 @@ func (b *Bot) preflight(c *Context) (bool, error) {
 			if joinURL != "" {
 				opts.ReplyMarkup = telegram.InlineURL(msgForceSubButton, joinURL)
 			}
-			_, _ = c.Msg.Respond(msgForceSub, opts)
+			_, _ = c.Msg.Respond(fmt.Sprintf(msgForceSub, b.forceSubTitle), opts)
 			return true, fmt.Errorf("force-sub")
 		}
 	}
@@ -479,7 +462,7 @@ func (b *Bot) preflight(c *Context) (bool, error) {
 			if secs < 1 {
 				secs = 1
 			}
-			_, _ = c.Msg.Respond(fmt.Sprintf(msgRateLimited, secs))
+			_, _ = c.Msg.Respond(fmt.Sprintf(msgRateLimited, secs, b.Cfg.RateLimit))
 			return true, fmt.Errorf("rate limited")
 		}
 	}
@@ -490,7 +473,7 @@ func (b *Bot) preflight(c *Context) (bool, error) {
 		if !b.globalLimiter.Allow() {
 			delay := b.globalLimiter.RetryAfter()
 			secs := int(delay.Seconds()) + 1
-			_, _ = c.Msg.Respond(fmt.Sprintf(msgRateLimited, secs))
+			_, _ = c.Msg.Respond(fmt.Sprintf(msgGlobalRateLimited, secs))
 			return true, fmt.Errorf("global rate limited")
 		}
 	}
@@ -498,9 +481,7 @@ func (b *Bot) preflight(c *Context) (bool, error) {
 	return false, nil
 }
 
-// promptActivation sends the activation prompt with an inline button linking
-// to the /activate/{token} HTTP route. The token is a one-time 128-bit
-// Crockford-base32 value with a 10-minute TTL.
+// The token is a one-time 128-bit Crockford-base32 value with a 10-minute TTL.
 func (b *Bot) promptActivation(c *Context) {
 	token, err := generateActivationToken()
 	if err != nil {
@@ -534,7 +515,6 @@ func (b *Bot) promptActivation(c *Context) {
 	_, _ = c.Msg.Respond(msgActivationRequired, opts)
 }
 
-// generateActivationToken returns a 128-bit random Crockford-base32 token (26 chars).
 func generateActivationToken() (string, error) {
 	buf := make([]byte, 16) // 128 bits
 	if _, err := crypto_rand.Read(buf); err != nil {

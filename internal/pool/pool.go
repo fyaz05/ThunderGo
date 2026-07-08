@@ -20,13 +20,11 @@ import (
 	"github.com/fyaz05/ThunderGo/internal/config"
 )
 
-// Client is one bot session in the pool, with an in-flight counter.
 type Client struct {
 	*telegram.Client
 	Inflight atomic.Int64
 }
 
-// Pool is a collection of independent bot clients.
 type Pool struct {
 	primary *Client
 	all     []*Client
@@ -59,7 +57,7 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Pool, erro
 		p.maxConcurrent = 8
 	}
 
-	// Primary client: receives updates (dispatcher must be initialized).
+	// dispatcher must be initialized.
 	primary, err := startClient(ctx, cfg, log, cfg.BotToken, 0, false, p.stopped)
 	if err != nil {
 		return nil, fmt.Errorf("starting primary client: %w", err)
@@ -140,15 +138,14 @@ func startClient(ctx context.Context, cfg *config.Config, log *slog.Logger, toke
 		return nil, fmt.Errorf("login client %d: %w", idx, err)
 	}
 
+	// UpdatesGetState activates MTProto push updates; without it, updates queue on the getUpdates side.
 	if !noUpdates {
-		// Sync the update state so we resume from the correct pts/qts offset
-		// instead of replaying or missing updates, and restrict command
-		// prefixes to "/" (default also allows "!") for consistent parsing.
 		if _, err := c.UpdatesGetState(); err != nil {
 			log.Warn("UpdatesGetState failed; update receiving may be impaired", "client", idx, "error", err)
 		} else {
 			log.Info("update state synced", "client", idx)
 		}
+		// Set "/" as the only command prefix (gogram default is "/!").
 		c.SetCommandPrefixes("/")
 	}
 
@@ -186,18 +183,14 @@ func makeFloodHandler(log *slog.Logger, idx int, stopped <-chan struct{}) func(e
 	}
 }
 
-// Primary returns the primary client (receives updates, handles commands).
 func (p *Pool) Primary() *Client { return p.primary }
 
-// All returns every client in the pool (primary first, then secondaries).
 func (p *Pool) All() []*Client { return p.all }
 
-// Len returns the total number of clients.
 func (p *Pool) Len() int { return len(p.all) }
 
-// AcquireBest atomically finds the least-loaded client under the cap,
-// reserves a slot by incrementing its in-flight counter, and returns the
-// client with an idempotent release callback (caller MUST defer it).
+// AcquireBest finds the least-loaded client under the cap and returns it with
+// an idempotent release callback (caller MUST defer it).
 func (p *Pool) AcquireBest() (c *Client, release func()) {
 	p.acquireMu.Lock()
 	defer p.acquireMu.Unlock()
@@ -237,7 +230,6 @@ func (p *Pool) AcquireBest() (c *Client, release func()) {
 	return best, func() { once.Do(func() { best.Inflight.Add(-1) }) }
 }
 
-// Pick returns the least-loaded client without reserving a slot.
 // Deprecated: prefer AcquireBest for atomic pick+reserve.
 func (p *Pool) Pick() *Client {
 	if len(p.all) == 0 {
@@ -274,14 +266,11 @@ func (p *Pool) Pick() *Client {
 	return best
 }
 
-// Acquire picks the least-loaded client, bumps its in-flight counter, and
-// returns it with an idempotent release callback (caller MUST defer it).
 // Deprecated: prefer AcquireBest.
 func (p *Pool) Acquire() (c *Client, release func()) {
 	return p.AcquireBest()
 }
 
-// TotalInflight returns the sum of in-flight counters across all clients.
 func (p *Pool) TotalInflight() int64 {
 	var total int64
 	for _, c := range p.all {
@@ -290,8 +279,7 @@ func (p *Pool) TotalInflight() int64 {
 	return total
 }
 
-// PerClientInflight returns the in-flight count for each client, in pool
-// order. Used by the /status endpoint.
+// Used by the /status endpoint.
 func (p *Pool) PerClientInflight() []int64 {
 	out := make([]int64, len(p.all))
 	for i, c := range p.all {
@@ -300,7 +288,6 @@ func (p *Pool) PerClientInflight() []int64 {
 	return out
 }
 
-// AcquireDownloadSlots blocks until n download slots are available.
 func (p *Pool) AcquireDownloadSlots(ctx context.Context, n int) error {
 	if p.downloadSem == nil {
 		return nil
@@ -308,7 +295,6 @@ func (p *Pool) AcquireDownloadSlots(ctx context.Context, n int) error {
 	return p.downloadSem.Acquire(ctx, int64(n))
 }
 
-// ReleaseDownloadSlots releases n download slots.
 func (p *Pool) ReleaseDownloadSlots(n int) {
 	if p.downloadSem != nil {
 		p.downloadSem.Release(int64(n))
