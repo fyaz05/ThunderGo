@@ -115,7 +115,7 @@ func startClient(ctx context.Context, cfg *config.Config, log *slog.Logger, toke
 		Session:          sessionFile,
 		SessionName:      fmt.Sprintf("bot-%02d", idx),
 		ParseMode:        "HTML",
-		LogLevel:         telegram.ErrorLevel, // quieter logs = faster
+		LogLevel:         telegram.LogInfo,
 		NoUpdates:        noUpdates,
 		SleepThresholdMs: 10000,
 		FloodHandler:     makeFloodHandler(log, idx, stopped),
@@ -138,6 +138,18 @@ func startClient(ctx context.Context, cfg *config.Config, log *slog.Logger, toke
 
 	if err := c.LoginBot(token); err != nil {
 		return nil, fmt.Errorf("login client %d: %w", idx, err)
+	}
+
+	if !noUpdates {
+		// Sync the update state so we resume from the correct pts/qts offset
+		// instead of replaying or missing updates, and restrict command
+		// prefixes to "/" (default also allows "!") for consistent parsing.
+		if _, err := c.UpdatesGetState(); err != nil {
+			log.Warn("UpdatesGetState failed; update receiving may be impaired", "client", idx, "error", err)
+		} else {
+			log.Info("update state synced", "client", idx)
+		}
+		c.SetCommandPrefixes("/")
 	}
 
 	return &Client{Client: c}, nil

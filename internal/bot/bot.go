@@ -171,7 +171,7 @@ func (b *Bot) Start(ctx context.Context) error {
 	}
 
 	b.registerBuiltinCommands()
-	b.primary.AddMessageHandler("*", b.dispatch)
+	b.primary.On(telegram.OnMessage, b.dispatch)
 	b.primary.OnCallback("broadcast_cancel", b.handleBroadcastCancel)
 	// Inline-button navigation callbacks: help/about re-send their messages;
 	// close deletes the host message. restart_broadcast is intentionally not

@@ -6,7 +6,7 @@ go 1.26
 toolchain go1.26.4
 
 require (
-	github.com/amarnathcjd/gogram v1.7.71
+	github.com/amarnathcjd/gogram v1.7.6
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/go-chi/chi/v5 v5.3.0
 	github.com/testcontainers/testcontainers-go/modules/mongodb v0.43.0
