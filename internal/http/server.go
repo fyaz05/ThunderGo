@@ -27,7 +27,7 @@ import (
 )
 
 // Version is the application version, overridable at link time. Defaults to "dev".
-var Version = "dev"
+var Version = "1.0"
 
 // Server is the HTTP gateway.
 type Server struct {
