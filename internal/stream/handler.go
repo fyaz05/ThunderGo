@@ -8,6 +8,7 @@ package stream
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -208,7 +209,7 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 		skip := start - alignedStart
 		written := int64(0)
 
-		for off := alignedStart; off < end; off += StreamChunkSize {
+		for off := alignedStart; off < end; {
 			if off > int64(math.MaxInt)-int64(StreamChunkSize) {
 				h.Log.Error("file too large for this build (32-bit int overflow)",
 					"token", tgutil.TokenHash(token), "offset", off)
@@ -222,7 +223,16 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 				err  error
 			}, 1)
 			go func() {
-				data, _, err := client.DownloadChunk(media, int(off), int(off+StreamChunkSize), StreamChunkSize)
+				defer func() {
+					if r := recover(); r != nil {
+						ch <- struct {
+							data []byte
+							err  error
+						}{nil, fmt.Errorf("panic inside DownloadChunk: %v", r)}
+					}
+				}()
+				// Defensive wrapper call: ensures aligned offsets and sizes
+				data, _, err := client.DownloadChunkAligned(media, int(off), int(off+StreamChunkSize), StreamChunkSize)
 				ch <- struct {
 					data []byte
 					err  error
@@ -242,7 +252,8 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 				return
 			}
 
-			if len(data) == 0 {
+			untrimmedLen := int64(len(data))
+			if untrimmedLen == 0 {
 				break
 			}
 
@@ -251,13 +262,16 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 				s = int(skip)
 			}
 
-			if int64(len(data))-int64(s) > contentLength-written {
+			if s >= len(data) {
+				data = nil
+			} else if int64(len(data))-int64(s) > contentLength-written {
 				data = data[s : s+int(contentLength-written)]
 			} else if s > 0 {
 				data = data[s:]
 			}
 
 			if len(data) == 0 {
+				off += untrimmedLen
 				continue
 			}
 
@@ -268,9 +282,16 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 				flusher.Flush()
 			}
 			written += int64(len(data))
+			off += untrimmedLen
+
 			if written >= contentLength {
 				break
 			}
+		}
+
+		if written < contentLength {
+			h.Log.Warn("range download ended prematurely",
+				"token", tgutil.TokenHash(token), "written", written, "contentLength", contentLength)
 		}
 		return
 	}
