@@ -1,9 +1,7 @@
 // NOTE: module path is mixed-case for historical reasons; do not change without updating all imports.
 module github.com/fyaz05/ThunderGo
 
-go 1.26
-
-toolchain go1.26.4
+go 1.26.5
 
 require (
 	github.com/amarnathcjd/gogram v1.7.7
