@@ -92,6 +92,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if hasRange && rng.Start == 0 && rng.End == rec.Size-1 {
+		hasRange = false
+	}
+
 	var contentLength int64
 	var status int
 	if hasRange {
@@ -178,9 +182,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *pool.Client, media telegram.MessageMedia, token string, hasRange bool, rng tgutil.Range, contentLength int64, threads int) {
 	flusher, _ := w.(http.Flusher)
 
-	// Timeout scales with content length (1s/MiB, 60s floor, 30m cap) + 60s grace.
+	// Timeout scales with content length (1s/MiB, 60s floor, 60m cap) + 60s grace.
 	const downloadTimeoutFloor = 60 * time.Second
-	const downloadTimeoutCeiling = 30 * time.Minute
+	const downloadTimeoutCeiling = 60 * time.Minute
 	secs := contentLength/(1<<20) + 1 // 1s per MiB, min 1s
 	if secs > math.MaxInt64/int64(time.Second) {
 		secs = math.MaxInt64 / int64(time.Second)
@@ -197,50 +201,88 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 	defer cancel()
 
 	if hasRange {
-		// Range path: fetch in 1 MiB sub-ranges (same memory profile as full-body).
-		for offset := rng.Start; offset <= rng.End; {
-			if dlCtx.Err() != nil {
-				return
-			}
-			end := offset + StreamChunkSize - 1
-			if end > rng.End {
-				end = rng.End
-			}
-			// 32-bit int guard: offsets > 2 GiB would wrap and serve wrong bytes.
-			if offset >= math.MaxInt32 || end >= math.MaxInt32 {
+		// Range path: fetch in 1 MiB sub-ranges aligned to StreamChunkSize.
+		start := rng.Start
+		end := rng.End + 1
+		alignedStart := (start / StreamChunkSize) * StreamChunkSize
+		skip := start - alignedStart
+		written := int64(0)
+
+		for off := alignedStart; off < end; off += StreamChunkSize {
+			if off > int64(math.MaxInt)-int64(StreamChunkSize) {
 				h.Log.Error("file too large for this build (32-bit int overflow)",
-					"token", tgutil.TokenHash(token), "offset", offset, "end", end)
+					"token", tgutil.TokenHash(token), "offset", off)
 				http.Error(w, "file too large for this build", http.StatusInternalServerError)
 				return
 			}
-			// DownloadChunk's end is EXCLUSIVE in gogram; HTTP Range.End is INCLUSIVE.
-			data, name, dErr := client.DownloadChunk(media, int(offset), int(end)+1, StreamChunkSize)
-			if dErr != nil {
-				h.Log.Warn("download chunk failed mid-stream",
-					"token", tgutil.TokenHash(token), "offset", offset, "end", end, "error", dErr)
+
+			// watchdog for Background context
+			ch := make(chan struct {
+				data []byte
+				err  error
+			}, 1)
+			go func() {
+				data, _, err := client.DownloadChunk(media, int(off), int(off+StreamChunkSize), StreamChunkSize)
+				ch <- struct {
+					data []byte
+					err  error
+				}{data, err}
+			}()
+
+			var data []byte
+			select {
+			case r := <-ch:
+				if r.err != nil {
+					h.Log.Warn("download chunk failed mid-stream",
+						"token", tgutil.TokenHash(token), "offset", off, "error", r.err)
+					return
+				}
+				data = r.data
+			case <-dlCtx.Done():
 				return
 			}
-			_ = name // DownloadChunk returns the resolved file name; unused in streaming path
+
 			if len(data) == 0 {
 				break
 			}
+
+			s := 0
+			if off == alignedStart {
+				s = int(skip)
+			}
+
+			if int64(len(data))-int64(s) > contentLength-written {
+				data = data[s : s+int(contentLength-written)]
+			} else if s > 0 {
+				data = data[s:]
+			}
+
+			if len(data) == 0 {
+				continue
+			}
+
 			if _, wErr := w.Write(data); wErr != nil {
 				return // client disconnected
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
-			offset = end + 1
+			written += int64(len(data))
+			if written >= contentLength {
+				break
+			}
 		}
 		return
 	}
 
 	// Full-body path. StreamThreads > 1 → parallel workers via orderedWriter;
 	// <= 1 → sequential path (zero overhead).
+	fw := &flushWriter{w: w, f: flusher}
+
 	if threads > 1 {
 		// Cap peak memory at max(threads×chunk, 5 MiB) for true parallel throughput.
 		maxBuffer := max(int64(threads)*StreamChunkSize, 5*1024*1024)
-		ow := newOrderedWriter(dlCtx, w, maxBuffer)
+		ow := newOrderedWriter(dlCtx, fw, maxBuffer)
 		defer ow.Close() // ensure cleanup even if DownloadMedia panics
 		_, dErr := client.DownloadMedia(media, &telegram.DownloadOptions{
 			Buffer:    ow,
@@ -252,24 +294,18 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 			h.Log.Debug("download media ended", "token", tgutil.TokenHash(token), "threads", threads, "error", dErr)
 			return
 		}
-		if flusher != nil {
-			flusher.Flush()
-		}
 		return
 	}
 
-	// Sequential path: pipes 1 MiB chunks directly to the ResponseWriter.
+	// Sequential path: pipes 1 MiB chunks directly to the ResponseWriter via flushWriter.
 	_, dErr := client.DownloadMedia(media, &telegram.DownloadOptions{
-		Buffer:    w,
+		Buffer:    fw,
 		ChunkSize: StreamChunkSize,
 		Ctx:       dlCtx,
 	})
 	if dErr != nil {
 		h.Log.Debug("download media ended", "token", tgutil.TokenHash(token), "error", dErr)
 		return
-	}
-	if flusher != nil {
-		flusher.Flush()
 	}
 }
 
@@ -333,6 +369,19 @@ func WithToken(ctx context.Context, token string) context.Context {
 func tokenFromContext(ctx context.Context) string {
 	v, _ := ctx.Value(ctxKeyToken).(string)
 	return v
+}
+
+type flushWriter struct {
+	w io.Writer
+	f http.Flusher
+}
+
+func (fw *flushWriter) Write(p []byte) (int, error) {
+	n, e := fw.w.Write(p)
+	if fw.f != nil {
+		fw.f.Flush()
+	}
+	return n, e
 }
 
 // StreamChunkSize is the size of each chunk downloaded from Telegram.
