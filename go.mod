@@ -8,10 +8,10 @@ toolchain go1.26.4
 require (
 	github.com/amarnathcjd/gogram v1.7.7
 	github.com/caarlos0/env/v11 v11.4.1
-	github.com/go-chi/chi/v5 v5.3.0
+	github.com/go-chi/chi/v5 v5.3.1
 	github.com/testcontainers/testcontainers-go/modules/mongodb v0.43.0
-	go.mongodb.org/mongo-driver/v2 v2.7.0
-	golang.org/x/sync v0.21.0
+	go.mongodb.org/mongo-driver/v2 v2.8.0
+	golang.org/x/sync v0.22.0
 	golang.org/x/time v0.15.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
