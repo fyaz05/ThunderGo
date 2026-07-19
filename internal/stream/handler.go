@@ -8,7 +8,6 @@ package stream
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -176,11 +175,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(status)
-	h.streamBody(w, r, client, media, token, hasRange, rng, contentLength, effectiveThreads)
+	h.streamBody(w, r, client, media, token, hasRange, rng, contentLength, effectiveThreads, rec.VaultMsgID)
 }
 
 // streamBody handles both full-body and range streaming.
-func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *pool.Client, media telegram.MessageMedia, token string, hasRange bool, rng tgutil.Range, contentLength int64, threads int) {
+func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *pool.Client, media telegram.MessageMedia, token string, hasRange bool, rng tgutil.Range, contentLength int64, threads int, vaultMsgID int32) {
 	flusher, _ := w.(http.Flusher)
 
 	// Timeout scales with content length (1s/MiB, 60s floor, 60m cap) + 60s grace.
@@ -202,77 +201,34 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 	defer cancel()
 
 	if hasRange {
-		// Range path: fetch in 1 MiB sub-ranges aligned to StreamChunkSize.
-		start := rng.Start
-		end := rng.End + 1
-		alignedStart := (start / StreamChunkSize) * StreamChunkSize
-		skip := start - alignedStart
+		// Range path: gogram's DownloadChunkCtx aligns each fetch to a 4096
+		// boundary and trims the excess internally, so we can pass the
+		// caller's exact [start, end) byte range directly. The context
+		// propagates cancellation and timeouts into the gogram fetch loop.
+		start := int(rng.Start)
+		if int64(start) > int64(math.MaxInt)-int64(StreamChunkSize) {
+			h.Log.Error("file too large for this build (int overflow)",
+				"token", tgutil.TokenHash(token), "offset", start)
+			http.Error(w, "file too large for this build", http.StatusInternalServerError)
+			return
+		}
+
 		written := int64(0)
+		for written < contentLength {
+			remaining := contentLength - written
+			chunkEnd := start + StreamChunkSize
+			if int64(chunkEnd-start) > remaining {
+				chunkEnd = start + int(remaining)
+			}
 
-		for off := alignedStart; off < end; {
-			if off > int64(math.MaxInt)-int64(StreamChunkSize) {
-				h.Log.Error("file too large for this build (32-bit int overflow)",
-					"token", tgutil.TokenHash(token), "offset", off)
-				http.Error(w, "file too large for this build", http.StatusInternalServerError)
+			data, _, dErr := client.DownloadChunkCtx(dlCtx, media, start, chunkEnd, StreamChunkSize)
+			if dErr != nil {
+				h.Log.Warn("download chunk failed mid-stream",
+					"token", tgutil.TokenHash(token), "offset", start, "error", dErr)
 				return
 			}
-
-			// watchdog for Background context
-			ch := make(chan struct {
-				data []byte
-				err  error
-			}, 1)
-			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						ch <- struct {
-							data []byte
-							err  error
-						}{nil, fmt.Errorf("panic inside DownloadChunk: %v", r)}
-					}
-				}()
-				// Defensive wrapper call: ensures aligned offsets and sizes
-				data, _, err := client.DownloadChunkAligned(media, int(off), int(off+StreamChunkSize), StreamChunkSize)
-				ch <- struct {
-					data []byte
-					err  error
-				}{data, err}
-			}()
-
-			var data []byte
-			select {
-			case r := <-ch:
-				if r.err != nil {
-					h.Log.Warn("download chunk failed mid-stream",
-						"token", tgutil.TokenHash(token), "offset", off, "error", r.err)
-					return
-				}
-				data = r.data
-			case <-dlCtx.Done():
-				return
-			}
-
-			untrimmedLen := int64(len(data))
-			if untrimmedLen == 0 {
-				break
-			}
-
-			s := 0
-			if off == alignedStart {
-				s = int(skip)
-			}
-
-			if s >= len(data) {
-				data = nil
-			} else if int64(len(data))-int64(s) > contentLength-written {
-				data = data[s : s+int(contentLength-written)]
-			} else if s > 0 {
-				data = data[s:]
-			}
-
 			if len(data) == 0 {
-				off += untrimmedLen
-				continue
+				break
 			}
 
 			if _, wErr := w.Write(data); wErr != nil {
@@ -282,11 +238,7 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 				flusher.Flush()
 			}
 			written += int64(len(data))
-			off += untrimmedLen
-
-			if written >= contentLength {
-				break
-			}
+			start += len(data)
 		}
 
 		if written < contentLength {
@@ -299,6 +251,9 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 	// Full-body path. StreamThreads > 1 → parallel workers via orderedWriter;
 	// <= 1 → sequential path (zero overhead).
 	fw := &flushWriter{w: w, f: flusher}
+	refetch := func() (any, error) {
+		return h.resolveVaultMedia(dlCtx, client, vaultMsgID)
+	}
 
 	if threads > 1 {
 		// Cap peak memory at max(threads×chunk, 5 MiB) for true parallel throughput.
@@ -306,10 +261,11 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 		ow := newOrderedWriter(dlCtx, fw, maxBuffer)
 		defer ow.Close() // ensure cleanup even if DownloadMedia panics
 		_, dErr := client.DownloadMedia(media, &telegram.DownloadOptions{
-			Buffer:    ow,
-			Threads:   threads,
-			ChunkSize: StreamChunkSize,
-			Ctx:       dlCtx,
+			Buffer:               ow,
+			Threads:              threads,
+			ChunkSize:            StreamChunkSize,
+			Ctx:                  dlCtx,
+			RefetchFileReference: refetch,
 		})
 		if dErr != nil {
 			h.Log.Debug("download media ended", "token", tgutil.TokenHash(token), "threads", threads, "error", dErr)
@@ -320,9 +276,10 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 
 	// Sequential path: pipes 1 MiB chunks directly to the ResponseWriter via flushWriter.
 	_, dErr := client.DownloadMedia(media, &telegram.DownloadOptions{
-		Buffer:    fw,
-		ChunkSize: StreamChunkSize,
-		Ctx:       dlCtx,
+		Buffer:               fw,
+		ChunkSize:            StreamChunkSize,
+		Ctx:                  dlCtx,
+		RefetchFileReference: refetch,
 	})
 	if dErr != nil {
 		h.Log.Debug("download media ended", "token", tgutil.TokenHash(token), "error", dErr)
