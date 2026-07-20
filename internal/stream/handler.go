@@ -232,7 +232,7 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 				consecutiveFails++
 				h.Log.Warn("download chunk failed mid-stream",
 					"token", tgutil.TokenHash(token), "offset", start, "error", dErr, "fails", consecutiveFails)
-				if consecutiveFails >= 3 {
+				if consecutiveFails >= maxConsecutiveChunkFails {
 					return
 				}
 				continue
@@ -373,6 +373,12 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 // StreamChunkSize is the size of each chunk downloaded from Telegram.
 // 1 MiB balances memory usage and throughput.
 const StreamChunkSize = 1 << 20
+
+// maxConsecutiveChunkFails is the number of consecutive chunk download failures
+// in the range path before giving up. Each failure means DownloadChunkCtx already
+// exhausted its internal retries (up to 20 attempts with backoff). This cap
+// prevents the HTTP layer from retrying the same failing range indefinitely.
+const maxConsecutiveChunkFails = 3
 
 // orderedWriter adapts gogram's parallel WriteAt (out-of-order chunks) into
 // the sequential io.Writer that http.ResponseWriter requires. It buffers
