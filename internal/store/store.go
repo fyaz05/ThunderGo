@@ -399,6 +399,47 @@ func (s *Store) InsertFile(ctx context.Context, f FileRecord) error {
 	return err
 }
 
+// ReplaceFile atomically replaces the canonical record for a stable file key.
+// It is used after ingestion proves that the old vault copy is missing or no
+// longer represents that file. Both cache indexes are invalidated before and
+// after the write so a concurrent reader cannot retain the stale record.
+func (s *Store) ReplaceFile(ctx context.Context, f FileRecord) error {
+	var oldHash string
+	if cached, ok := s.fileByKey.get(f.FileKey); ok {
+		oldHash = cached.Hash
+	}
+	if oldHash == "" {
+		var old FileRecord
+		if err := s.files.FindOne(ctx, bson.M{"file_key": f.FileKey}, options.FindOne().SetProjection(bson.M{"hash": 1})).Decode(&old); err == nil {
+			oldHash = old.Hash
+		} else if !errors.Is(err, mongo.ErrNoDocuments) {
+			return err
+		}
+	}
+
+	s.fileByKey.invalidate(f.FileKey)
+	if oldHash != "" {
+		s.fileByHash.invalidate(oldHash)
+	}
+	s.fileByHash.invalidate(f.Hash)
+
+	_, err := s.files.ReplaceOne(ctx, bson.M{"file_key": f.FileKey}, f, options.Replace().SetUpsert(true))
+	if err != nil {
+		return err
+	}
+
+	// Post-write invalidation closes the cache race window, then install fresh
+	// value copies for both lookup keys.
+	s.fileByKey.invalidate(f.FileKey)
+	if oldHash != "" {
+		s.fileByHash.invalidate(oldHash)
+	}
+	s.fileByHash.invalidate(f.Hash)
+	s.fileByHash.set(f.Hash, f)
+	s.fileByKey.set(f.FileKey, f)
+	return nil
+}
+
 // FindFileByKey looks up a file by dedup key. Cached. No projection: callers
 // (e.g. stream handler) need all fields. Returns a fresh value copy.
 func (s *Store) FindFileByKey(ctx context.Context, key string) (*FileRecord, error) {

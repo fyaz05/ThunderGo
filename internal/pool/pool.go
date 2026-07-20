@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/amarnathcjd/gogram/telegram"
-	"golang.org/x/sync/semaphore"
 
 	"github.com/fyaz05/ThunderGo/internal/config"
 )
@@ -23,14 +22,34 @@ import (
 type Client struct {
 	*telegram.Client
 	Inflight atomic.Int64
+
+	// lookupSem bounds non-context GetMessages calls. A cancelled HTTP request
+	// cannot stop gogram's lookup immediately, so its permit is held until the
+	// detached call actually returns instead of allowing unbounded goroutines.
+	lookupSem chan struct{}
+}
+
+// AcquireLookup reserves one bounded vault-lookup slot. A zero-value test
+// Client has no semaphore and intentionally behaves as an unlimited no-op.
+func (c *Client) AcquireLookup(ctx context.Context) (release func(), ok bool) {
+	if c == nil || c.lookupSem == nil {
+		return func() {}, c != nil
+	}
+	select {
+	case c.lookupSem <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-c.lookupSem }) }, true
+	case <-ctx.Done():
+		return func() {}, false
+	}
 }
 
 type Pool struct {
 	primary *Client
 	all     []*Client
 
-	// maxConcurrent caps simultaneous downloads per client before Pick() falls
-	// back to least-loaded overall. Default 8 balances parallelism vs. rate-limit risk.
+	// maxConcurrent is a hard simultaneous-stream cap per client. Requests are
+	// rejected by the HTTP layer when every client is at this cap.
 	maxConcurrent int
 
 	stopped  chan struct{} // closed by Stop() to interrupt flood handler sleeps
@@ -39,9 +58,6 @@ type Pool struct {
 	// acquireMu serialises AcquireBest so slot selection and reservation
 	// happen atomically.
 	acquireMu sync.Mutex
-
-	// downloadSem caps total concurrent download workers at 12 per bot session.
-	downloadSem *semaphore.Weighted
 }
 
 // New creates and connects every client in the pool: one primary (receives
@@ -77,10 +93,6 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Pool, erro
 
 	log.Info("telegram client pool ready", "total_clients", len(p.all), "primary_dc", p.primary.GetDC())
 
-	// 12 concurrent download workers per bot session (Telegram empirical limit).
-	// Total weight = 12 × clients so concurrency scales with pool size.
-	// Pick() distributes load evenly, so no single session exceeds ~12 workers.
-	p.downloadSem = semaphore.NewWeighted(int64(12 * len(p.all)))
 	return p, nil
 }
 
@@ -149,7 +161,11 @@ func startClient(ctx context.Context, cfg *config.Config, log *slog.Logger, toke
 		c.SetCommandPrefixes("/")
 	}
 
-	return &Client{Client: c}, nil
+	lookupCap := cfg.MaxConcurrentPerClient
+	if lookupCap < 1 {
+		lookupCap = 8
+	}
+	return &Client{Client: c, lookupSem: make(chan struct{}, lookupCap)}, nil
 }
 
 // maxFloodWaitSecs is the upper bound on flood-wait retries. Waits above
@@ -213,16 +229,10 @@ func (p *Pool) AcquireBest() (c *Client, release func()) {
 		}
 	}
 	if best == nil {
-		// Pass 2: all at capacity — pick least-loaded overall.
-		best = p.all[0]
-		bestCount = best.Inflight.Load()
-		for _, cl := range p.all[1:] {
-			n := cl.Inflight.Load()
-			if n < bestCount {
-				best = cl
-				bestCount = n
-			}
-		}
+		// All clients are at their hard stream cap. The HTTP handler turns
+		// this into a short Retry-After response rather than queueing work on
+		// an already saturated Telegram session.
+		return nil, func() {}
 	}
 
 	best.Inflight.Add(1)
@@ -253,17 +263,7 @@ func (p *Pool) Pick() *Client {
 		return best
 	}
 
-	// Pass 2: all at capacity — pick least-loaded.
-	best = p.all[0]
-	bestCount = best.Inflight.Load()
-	for _, c := range p.all[1:] {
-		n := c.Inflight.Load()
-		if n < bestCount {
-			best = c
-			bestCount = n
-		}
-	}
-	return best
+	return nil
 }
 
 // Deprecated: prefer AcquireBest.
@@ -286,19 +286,6 @@ func (p *Pool) PerClientInflight() []int64 {
 		out[i] = c.Inflight.Load()
 	}
 	return out
-}
-
-func (p *Pool) AcquireDownloadSlots(ctx context.Context, n int) error {
-	if p.downloadSem == nil {
-		return nil
-	}
-	return p.downloadSem.Acquire(ctx, int64(n))
-}
-
-func (p *Pool) ReleaseDownloadSlots(n int) {
-	if p.downloadSem != nil {
-		p.downloadSem.Release(int64(n))
-	}
 }
 
 // Stop stops every client in parallel, context-aware so a stuck client.Stop()

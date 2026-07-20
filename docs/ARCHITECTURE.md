@@ -56,7 +56,7 @@ flowchart TB
 | `internal/ingest` | File ingestion + dedup. Per-file-key mutex + cross-process Mongo lock (TTL 60s). Fast path: cache hit → reuse. Slow path: forward to vault, insert record. |
 | `internal/pool` | 1 primary client (receives updates) + N secondary clients (download-only) per `TG_EXTRA_BOTSN`. Least-loaded selection under `TG_MAX_CONCURRENT_PER_CLIENT`. Flood-wait aware. |
 | `internal/store` | MongoDB persistence + in-memory caches (file-by-hash, file-by-key, banned, authorized, activated). TTL indexes auto-expire tokens, activations, locks. |
-| `internal/stream` | HTTP byte streamer. Resolves vault media → sets headers → streams 1 MiB chunks. Range support. `TG_STREAM_THREADS` (1–8) controls parallel chunk downloads per full-body stream (Range path is always sequential). Timeout = `clamp(1s/MiB, min=60s, max=30min)` + 60s grace period. |
+| `internal/stream` | HTTP byte streamer. Resolves vault media → sets headers → streams 1 MiB chunks. Range support. Full-body and Range downloads are sequential 1 MiB transfers driven by the request context. |
 | `internal/http` | chi router. CORS wildcard. `redactPath` masks `/f/{hash}/...` and `/activate/{token}` in access logs. `go:embed`-s the player HTML. |
 | `internal/ratelimit` | Two limiters: **per-user GCRA** (16 shards, atomic CAS, 60-second window, disabled when `TG_RATE_LIMIT=0`) + **global token-bucket** (`TG_GLOBAL_RPS`, burst hardcoded to 2× RPS, disabled when `TG_GLOBAL_RPS=0`). Owner + authorized bypass both. In-memory. |
 | `internal/shortener` | Calls external shortener API. LRU cache (10k) + `singleflight` dedup. Host-mismatch validation (open-redirect defense). Disabled when `TG_SHORTENER_API_KEY` empty. |
@@ -156,8 +156,7 @@ Single process, multi-goroutine.
 
 - **Bot dispatch**: one goroutine per update, bounded by a semaphore of 128.
 - **HTTP handlers**: one goroutine per request, managed by `net/http`. Streaming downloads bypass read/write timeouts; the stream handler's own timeout formula (max 30 min) bounds duration.
-- **Pool per-client cap**: `TG_MAX_CONCURRENT_PER_CLIENT` (default 8). `Pool.Pick` skips clients at/above the cap on pass 1, falls back to least-loaded overall on pass 2.
-- **Stream parallelism**: `TG_STREAM_THREADS` (default 4 = parallel). 2–8 spawns that many gogram download workers per full-body stream (orderedWriter reassembles in order). 1 forces sequential. Range requests stay sequential.
+- **Pool per-client cap**: `TG_MAX_CONCURRENT_PER_CLIENT` (default 8). Requests are rejected with a short retry response when every client is at the cap.
 - **Background sweepers**: 6 cache sweepers (5-min), dedup-mutex cleanup (10-min), rate-limiter sweep (5-min), HTTP keepalive (`TG_KEEPALIVE_SECS`, default 300s).
 - **Worker pools**: broadcast = 4 workers, link batch = 5 workers.
 

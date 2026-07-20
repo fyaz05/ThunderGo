@@ -65,7 +65,7 @@
 ### Performance
 - **Zero Disk I/O** — streams from Telegram directly to the client
 - **Low Memory** — ~1 MiB RAM per active stream
-- **Go Concurrency** — goroutines with configurable stream threads (1-8)
+- **Sequential Per-File Streaming** — one ordered Telegram transfer per opened file link
 - **Multi-Bot Pool** — extra bot tokens for more download throughput
 
 ### Access Control
@@ -258,7 +258,7 @@ Copy `.env.example` to `.env` and fill in the **7 required fields**. All options
 
 ### Key Optional Variables
 
-`TG_PRIVATE_MODE`, `TG_TOKEN_ENABLED`, `TG_FORCE_SUB_CHANNEL_ID`, `TG_RATE_LIMIT`, `TG_GLOBAL_RPS`, `TG_FILE_TTL_DAYS`, `TG_LOG_LEVEL`, `TG_EXTRA_BOTS1..50`, `TG_STREAM_THREADS`, `TG_HTTP_PORT`, `TG_BIND_ADDRESS`, `UPSTREAM_REPO`. See [Configuration Reference](docs/CONFIGURATION.md).
+`TG_PRIVATE_MODE`, `TG_TOKEN_ENABLED`, `TG_FORCE_SUB_CHANNEL_ID`, `TG_RATE_LIMIT`, `TG_GLOBAL_RPS`, `TG_FILE_TTL_DAYS`, `TG_LOG_LEVEL`, `TG_EXTRA_BOTS1..50`, `TG_HTTP_PORT`, `TG_BIND_ADDRESS`, `UPSTREAM_REPO`. See [Configuration Reference](docs/CONFIGURATION.md).
 
 ---
 

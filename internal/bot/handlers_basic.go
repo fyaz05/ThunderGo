@@ -373,7 +373,7 @@ I'm your go-to bot for <b>instant download &amp; streaming links</b> from Telegr
 🔍 <b>Seek Support</b> — jump to any position in streamed media
 📚 <b>Batch Mode</b> — process multiple files at once with <code>/link N</code>
 💬 <b>Multi-Chat</b> — works in private chats, groups, and channels
-🚀 <b>High-Speed</b> — multi-client pool with parallel download threads</blockquote>
+🚀 <b>High-Speed</b> — multi-client pool for concurrent independent downloads</blockquote>
 
 <b>🛠️ Tech Stack</b>
 <blockquote>🐹 <b>Language:</b> Go 1.26

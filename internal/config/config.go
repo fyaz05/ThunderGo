@@ -59,7 +59,6 @@ type Config struct {
 	BindAddress            string `env:"TG_BIND_ADDRESS"              envDefault:"0.0.0.0"` // interface to listen on
 	HTTPPort               int    `env:"TG_HTTP_PORT"                 envDefault:"0"`       // 0 = derive from TG_URL scheme+port; >0 = override
 	BatchCap               int    `env:"TG_BATCH_CAP"                 envDefault:"50"`      // max files per /link N batch
-	StreamThreads          int    `env:"TG_STREAM_THREADS"            envDefault:"4"`       // 1=sequential; 2-8=parallel download threads per stream
 
 	// Auto-update (non-Docker)
 	UpstreamRepo   string `env:"UPSTREAM_REPO"`                                // git URL for auto-update on restart
@@ -119,9 +118,6 @@ func (c *Config) validate() error {
 	if c.TokenEnabled && c.TokenTTLHours <= 0 {
 		return fmt.Errorf("TG_TOKEN_TTL_HOURS must be positive when TG_TOKEN_ENABLED is true, got %d", c.TokenTTLHours)
 	}
-	if c.StreamThreads < 1 || c.StreamThreads > 8 {
-		return fmt.Errorf("TG_STREAM_THREADS must be in [1, 8], got %d", c.StreamThreads)
-	}
 	if c.MaxConcurrentPerClient < 1 {
 		return fmt.Errorf("TG_MAX_CONCURRENT_PER_CLIENT must be >= 1, got %d", c.MaxConcurrentPerClient)
 	}
@@ -171,12 +167,20 @@ func (c *Config) ListenPort() int {
 // FileURL builds the public URL for a file's player page. File URLs are PUBLIC —
 // no per-file credential.
 func (c *Config) FileURL(hash, filename string) string {
-	return fmt.Sprintf("%s/f/%s/%s", c.BaseURL, hash, url.PathEscape(filename))
+	return fmt.Sprintf("%s/f/%s/%s", c.BaseURL, hash, escapeFileName(filename))
 }
 
 // FileRawURL builds the public URL for the raw-bytes endpoint.
 func (c *Config) FileRawURL(hash, filename string) string {
-	return fmt.Sprintf("%s/f/%s/%s/raw", c.BaseURL, hash, url.PathEscape(filename))
+	return fmt.Sprintf("%s/f/%s/%s/raw", c.BaseURL, hash, escapeFileName(filename))
+}
+
+// escapeFileName mirrors FileToLink's link-safe filename behavior. A slash
+// must be replaced before PathEscape: net/http unescapes %2F into URL.Path
+// before chi matches route segments, so escaping the slash alone can create a
+// broken link with an extra path segment.
+func escapeFileName(filename string) string {
+	return url.PathEscape(strings.ReplaceAll(filename, "/", "_"))
 }
 
 // IsOwner reports whether the given user ID is the configured owner.

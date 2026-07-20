@@ -67,7 +67,7 @@ func New(cfg *config.Config, p *pool.Pool, s *store.Store, in *ingest.Ingester, 
 		Log:           log,
 		StartedAt:     time.Now(),
 		Templates:     tmpl,
-		streamHandler: stream.New(p, s, in, log, cfg.StreamThreads),
+		streamHandler: stream.New(p, s, in, log),
 		keepaliveStop: make(chan struct{}),
 	}
 

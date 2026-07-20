@@ -79,42 +79,31 @@ func TestPickEmptyPool(t *testing.T) {
 	}
 }
 
-func TestPickAllAtCapacityTie(t *testing.T) {
+func TestPickAllAtCapacityReturnsNil(t *testing.T) {
 	t.Parallel()
-	// Both clients at cap (maxConcurrent=2, both Inflight=2). Pass 1
-	// finds nothing under cap → Pass 2 falls back to least-loaded. With
-	// a tie, Pass 2 keeps the initial best (all[0]).
 	p := fakePool(2)
 	p.maxConcurrent = 2
 	p.all[0].Inflight.Store(2)
-	p.all[1].Inflight.Store(2)
+	p.all[1].Inflight.Store(3)
 
-	got := p.Pick()
-	if got == nil {
-		t.Fatalf("Pick() = nil; want a client (fallback should still pick one)")
-	}
-	if got.Inflight.Load() != 2 {
-		t.Errorf("Pick() returned client with inflight=%d; want 2", got.Inflight.Load())
-	}
-	if got != p.all[0] {
-		t.Errorf("Pick() = client[%d]; want client[0] on tie", indexOf(p.all, got))
+	if got := p.Pick(); got != nil {
+		t.Errorf("Pick() = client[%d]; want nil when every client is at capacity", indexOf(p.all, got))
 	}
 }
 
-func TestPickAllAtCapacityPicksLower(t *testing.T) {
+func TestAcquireAllAtCapacityReturnsNil(t *testing.T) {
 	t.Parallel()
-	// All over cap but unequal → Pass 2 picks the strictly lowest.
-	p := fakePool(3)
-	p.maxConcurrent = 2
-	p.all[0].Inflight.Store(5)
-	p.all[1].Inflight.Store(3)
-	p.all[2].Inflight.Store(9)
+	p := fakePool(2)
+	p.maxConcurrent = 1
+	p.all[0].Inflight.Store(1)
+	p.all[1].Inflight.Store(1)
 
-	got := p.Pick()
-	if got != p.all[1] {
-		t.Errorf("Pick() = client[%d] (inflight=%d); want client[1] (inflight=3)",
-			indexOf(p.all, got), got.Inflight.Load())
+	client, release := p.AcquireBest()
+	if client != nil {
+		t.Fatalf("AcquireBest() = %v, want nil when every client is at cap", client)
 	}
+	// The no-client release remains safe for uniform deferred cleanup.
+	release()
 }
 
 func TestPickPrefersUnderCap(t *testing.T) {
@@ -310,6 +299,33 @@ func TestLenAndPrimaryEmpty(t *testing.T) {
 	if p.Primary() != nil {
 		t.Errorf("Primary() on empty pool = %v; want nil", p.Primary())
 	}
+}
+
+// ---------- Vault lookup limiter ----------
+
+func TestAcquireLookupHonorsContextAndRelease(t *testing.T) {
+	t.Parallel()
+	p := fakePool(1)
+	p.all[0].lookupSem = make(chan struct{}, 1)
+
+	release, ok := p.all[0].AcquireLookup(context.Background())
+	if !ok {
+		t.Fatal("first AcquireLookup() = false, want true")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, ok := p.all[0].AcquireLookup(ctx); ok {
+		t.Fatal("AcquireLookup() succeeded with a cancelled context while slot is held")
+	}
+
+	release()
+	release() // release is idempotent
+	release2, ok := p.all[0].AcquireLookup(context.Background())
+	if !ok {
+		t.Fatal("AcquireLookup() = false after release, want true")
+	}
+	release2()
 }
 
 // ---------- makeFloodHandler ----------

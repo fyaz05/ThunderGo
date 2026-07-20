@@ -1,8 +1,6 @@
-// Package stream implements the HTTP streaming handler. It pipes bytes from
-// Telegram to the HTTP socket with zero intermediate disk writes.
-//
-// Mounted at /f/{token}/{filename}/raw. Supports Range requests, HEAD, and
-// CORS preflight (handled by the gateway).
+// Package stream implements the HTTP file handler. It resolves a vault copy
+// with the selected Telegram client and pipes its bytes to the HTTP socket
+// without intermediate disk writes.
 package stream
 
 import (
@@ -10,12 +8,11 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"math"
 	"net/http"
 	"strconv"
-	"sync"
 	"time"
 
+	gogram "github.com/amarnathcjd/gogram"
 	"github.com/amarnathcjd/gogram/telegram"
 
 	"github.com/fyaz05/ThunderGo/internal/ingest"
@@ -24,34 +21,52 @@ import (
 	"github.com/fyaz05/ThunderGo/internal/tgutil"
 )
 
-// Handler is the streaming HTTP handler.
+// Resolver sentinels separate a permanently stale vault record from a
+// transient Telegram/network failure. A stale record must be evicted; a
+// transient error must not destroy a still-valid public link.
+var (
+	ErrVaultMessageMissing = errors.New("vault message missing")
+	ErrVaultMessageNoMedia = errors.New("vault message has no media")
+	ErrVaultRecordMismatch = errors.New("vault media does not match file record")
+)
+
+const (
+	overloadRetryAfterSeconds = 2
+	vaultLookupTimeout        = 30 * time.Second
+)
+
+// Handler is the HTTP file-streaming handler.
 type Handler struct {
 	Pool     *pool.Pool
 	Store    *store.Store
 	Log      *slog.Logger
 	Ingester *ingest.Ingester
-
-	// handlerWg tracks in-flight fire-and-forget goroutines so Close() can drain.
-	handlerWg sync.WaitGroup
-
-	// StreamThreads is the number of concurrent download workers per full-body
-	// stream (1 = sequential; 2-8 = parallel via orderedWriter). Range path is
-	// always sequential. Set from TG_STREAM_THREADS (validated [1, 8] in config).
-	StreamThreads int
 }
 
-// New wires up the Handler. streamThreads <= 1 keeps the sequential path.
-func New(p *pool.Pool, s *store.Store, in *ingest.Ingester, log *slog.Logger, streamThreads int) *Handler {
-	return &Handler{Pool: p, Store: s, Log: log, Ingester: in, StreamThreads: streamThreads}
+// New wires the sequential FileToLink-compatible serving path. One admitted
+// HTTP file request always uses one sequential Telegram download; it never
+// splits a file into parallel Telegram workers.
+func New(p *pool.Pool, s *store.Store, in *ingest.Ingester, log *slog.Logger) *Handler {
+	return &Handler{Pool: p, Store: s, Log: log, Ingester: in}
 }
 
-// ServeHTTP implements http.Handler. The chi router extracts the {token}
-// URL parameter and stashes it in the request context.
+// ServeHTTP resolves a stored file record, reserves one stream ticket on a
+// Telegram client, and serves either metadata or bytes. The ticket is acquired
+// before route-specific work and is released exactly once on every path.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	token := tokenFromContext(r.Context())
 	if token == "" {
 		w.Header().Set("Cache-Control", "no-store")
 		http.NotFound(w, r)
+		return
+	}
+	// chi normally rejects unsupported methods before this handler is reached.
+	// Keep this guard here as well so an alternate mount cannot turn POST/PUT
+	// into a Telegram download.
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD, OPTIONS")
+		w.Header().Set("Cache-Control", "no-store")
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -67,18 +82,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Best-effort seen_count++ on a detached 5s context: a slow DB write must
-	// not delay bytes. Caches are not invalidated (last_seen_at is advisory).
-	h.handlerWg.Add(1)
-	go func() {
-		defer h.handlerWg.Done()
-		defer func() { recover() }()
-		incCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := h.Store.IncrementSeenCount(incCtx, rec.FileKey); err != nil {
-			h.Log.Debug("incrementing seen count", "token", tgutil.TokenHash(token), "error", err)
-		}
-	}()
+	// Store uses a non-blocking touch buffer in production, so this does not
+	// delay bytes. Seen counters are advisory and must never affect streaming.
+	if err := h.Store.IncrementSeenCount(r.Context(), rec.FileKey); err != nil {
+		h.Log.Debug("incrementing seen count", "token", tgutil.TokenHash(token), "error", err)
+	}
+
+	// Match FileToLink's admission lifecycle: choose and reserve a client before
+	// request-specific work. Do not queue work on an already saturated client.
+	client, release := h.Pool.AcquireBest()
+	if client == nil {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", strconv.Itoa(overloadRetryAfterSeconds))
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	defer release()
 
 	rng, hasRange, err := tgutil.ParseRange(r.Header.Get("Range"), rec.Size)
 	if err != nil {
@@ -91,23 +110,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
-
 	if hasRange && rng.Start == 0 && rng.End == rec.Size-1 {
 		hasRange = false
 	}
 
 	var contentLength int64
-	var status int
+	status := http.StatusOK
 	if hasRange {
 		contentLength = rng.End - rng.Start + 1
 		status = http.StatusPartialContent
 	} else {
 		contentLength = rec.Size
-		status = http.StatusOK
 	}
 
-	// HEAD returns metadata headers without consuming a download slot or
-	// resolving vault media. Headers come from the DB record alone.
+	// DownloadChunkCtx accepts int offsets. Reject an unsupported Range before
+	// headers are committed, rather than trying to write an HTTP error mid-body.
+	if hasRange && (rng.Start > maxNativeInt() || rng.End > maxNativeInt()) {
+		w.Header().Set("Cache-Control", "no-store")
+		http.Error(w, "file range is unsupported on this build", http.StatusInternalServerError)
+		return
+	}
+
+	// HEAD intentionally uses stored metadata only, as FileToLink does. It still
+	// owns a short-lived stream ticket so load accounting remains consistent.
 	if r.Method == http.MethodHead {
 		h.setCommonHeaders(w, rec, tgutil.QueryDisposition(r))
 		w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
@@ -118,185 +143,121 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Acquire download semaphore BEFORE pool.Acquire — caps total concurrent
-	// workers at 12 per bot session to prevent FLOOD_WAIT.
-	effectiveThreads := h.StreamThreads
-	if rec.Size < 5*1024*1024 {
-		effectiveThreads = 1
-		h.Log.Debug("reduced to 1 thread for small file", "token", tgutil.TokenHash(token), "size", rec.Size)
-	}
-	if err := h.Pool.AcquireDownloadSlots(r.Context(), effectiveThreads); err != nil {
+	// Resolve and validate the vault media with the same client that will
+	// download it. This supplies a fresh file reference for that Telegram
+	// session and prevents a corrupt DB row from serving unrelated media.
+	media, err := h.resolveVaultMedia(r.Context(), client, rec)
+	if err != nil {
 		w.Header().Set("Cache-Control", "no-store")
+		if isPermanentVaultError(err) {
+			h.Log.Warn("stale vault file record", "token", tgutil.TokenHash(token), "vault_msg_id", rec.VaultMsgID, "error", err)
+			deleteCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if delErr := h.Store.DeleteFileByHash(deleteCtx, token); delErr != nil {
+				h.Log.Debug("could not delete stale file record", "token", tgutil.TokenHash(token), "error", delErr)
+			}
+			cancel()
+			http.NotFound(w, r)
+			return
+		}
+		h.Log.Warn("transient vault media error", "token", tgutil.TokenHash(token), "error", err)
+		w.Header().Set("Retry-After", strconv.Itoa(overloadRetryAfterSeconds))
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	defer h.Pool.ReleaseDownloadSlots(effectiveThreads)
 
-	// Acquire a client from the pool (least-loaded).
-	client, release := h.Pool.Acquire()
-	if client == nil {
-		w.Header().Set("Cache-Control", "no-store")
-		http.Error(w, "no client available", http.StatusServiceUnavailable)
-		return
-	}
-	defer release()
-
-	// Resolve media BEFORE setting headers so a 404/503 returns clean with
-	// Cache-Control: no-store. Same client that downloads → valid file_reference.
-	media, err := h.resolveVaultMedia(r.Context(), client, rec.VaultMsgID)
-	if err != nil {
-		// Only delete on definitive-gone errors; transient errors must not delete.
-		var rpcErr *telegram.RpcError
-		isGone := errors.As(err, &rpcErr) &&
-			(rpcErr.Message == "MESSAGE_ID_INVALID" || rpcErr.Message == "MESSAGE_DELETED")
-
-		w.Header().Set("Cache-Control", "no-store")
-
-		if isGone {
-			h.Log.Warn("vault message gone; deleting stale record",
-				"token", tgutil.TokenHash(token), "vault_msg_id", rec.VaultMsgID)
-			if delErr := h.Store.DeleteFileByHash(r.Context(), token); delErr != nil {
-				h.Log.Debug("could not delete stale file record", "token", tgutil.TokenHash(token), "error", delErr)
-			}
-			http.NotFound(w, r)
-		} else {
-			h.Log.Warn("transient vault media error; returning 503",
-				"token", tgutil.TokenHash(token), "error", err)
-			http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
-		}
-		return
-	}
-
-	// All headers must be set before WriteHeader.
 	h.setCommonHeaders(w, rec, tgutil.QueryDisposition(r))
 	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
 	if hasRange {
 		w.Header().Set("Content-Range", tgutil.ContentRangeValue(rng, rec.Size))
 	}
-
 	w.WriteHeader(status)
-	h.streamBody(w, r, client, media, token, hasRange, rng, contentLength, effectiveThreads, rec.VaultMsgID)
+	h.streamBody(w, r, client, media, rec, token, hasRange, rng, contentLength)
 }
 
-// streamBody handles both full-body and range streaming.
-func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *pool.Client, media telegram.MessageMedia, token string, hasRange bool, rng tgutil.Range, contentLength int64, threads int, vaultMsgID int32) {
+// streamBody sends the requested bytes sequentially. It relies on the request
+// context plus gogram's per-RPC timeouts/retries; there is deliberately no
+// short whole-transfer deadline that can truncate a healthy slow large file.
+func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *pool.Client, media telegram.MessageMedia, rec *store.FileRecord, token string, hasRange bool, rng tgutil.Range, contentLength int64) {
 	flusher, _ := w.(http.Flusher)
-
-	// Timeout scales with content length (1s/MiB, 60s floor, 60m cap) + 60s grace.
-	const downloadTimeoutFloor = 60 * time.Second
-	const downloadTimeoutCeiling = 60 * time.Minute
-	secs := contentLength/(1<<20) + 1 // 1s per MiB, min 1s
-	if secs > math.MaxInt64/int64(time.Second) {
-		secs = math.MaxInt64 / int64(time.Second)
-	}
-	needed := time.Duration(secs) * time.Second
-	if needed < downloadTimeoutFloor {
-		needed = downloadTimeoutFloor
-	}
-	if needed > downloadTimeoutCeiling {
-		needed = downloadTimeoutCeiling
-	}
-	timeout := needed + 60*time.Second // grace period
-	dlCtx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
-
+	dlCtx := r.Context()
 	refetch := func() (any, error) {
-		return h.resolveVaultMedia(dlCtx, client, vaultMsgID)
+		return h.resolveVaultMedia(dlCtx, client, rec)
 	}
 
 	if hasRange {
-		// Range path: gogram's DownloadChunkCtx aligns each fetch to a 4096
-		// boundary and trims the excess internally, so we can pass the
-		// caller's exact [start, end) byte range directly. The context
-		// propagates cancellation and timeouts into the gogram fetch loop.
-		start := int(rng.Start)
-		if int64(start) > int64(math.MaxInt)-int64(StreamChunkSize) {
-			h.Log.Error("file too large for this build (int overflow)",
-				"token", tgutil.TokenHash(token), "offset", start)
-			http.Error(w, "file too large for this build", http.StatusInternalServerError)
-			return
-		}
-
+		// Match FileToLink's serving method: Telegram is read in 1 MiB
+		// chunk-aligned windows, then leading/trailing bytes are trimmed for
+		// the exact HTTP range. Besides matching PyroFork stream_media(), this
+		// keeps CDN requests on the same stable chunk boundaries as its hashes.
+		wireStart := int((rng.Start / StreamChunkSize) * StreamChunkSize)
+		skip := int(rng.Start - int64(wireStart))
 		written := int64(0)
 		consecutiveFails := 0
 		for written < contentLength {
-			remaining := contentLength - written
-			chunkEnd := start + StreamChunkSize
-			if int64(chunkEnd-start) > remaining {
-				chunkEnd = start + int(remaining)
+			if int64(wireStart) > maxNativeInt()-int64(StreamChunkSize) {
+				h.Log.Warn("range offset overflow before chunk fetch", "token", tgutil.TokenHash(token), "offset", wireStart)
+				return
 			}
-
-			data, _, dErr := client.DownloadChunkCtx(dlCtx, media, start, chunkEnd, StreamChunkSize,
+			wireEnd := wireStart + StreamChunkSize
+			raw, _, dErr := client.DownloadChunkCtx(dlCtx, media, wireStart, wireEnd, StreamChunkSize,
 				&telegram.DownloadOptions{RefetchFileReference: refetch})
 			if dErr != nil {
 				consecutiveFails++
-				h.Log.Warn("download chunk failed mid-stream",
-					"token", tgutil.TokenHash(token), "offset", start, "error", dErr, "fails", consecutiveFails)
+				h.Log.Warn("range chunk failed", "token", tgutil.TokenHash(token), "offset", wireStart, "error", dErr, "fails", consecutiveFails)
 				if consecutiveFails >= maxConsecutiveChunkFails {
 					return
 				}
 				continue
 			}
 			consecutiveFails = 0
-			if len(data) == 0 {
+			if len(raw) == 0 {
 				break
 			}
 
-			if _, wErr := w.Write(data); wErr != nil {
-				return // client disconnected
+			rawLen := len(raw)
+			if skip >= rawLen {
+				skip -= rawLen
+				wireStart += rawLen
+				continue
 			}
-			if flusher != nil {
-				flusher.Flush()
+			data := raw[skip:]
+			skip = 0
+			remaining := contentLength - written
+			if int64(len(data)) > remaining {
+				data = data[:remaining]
 			}
-			written += int64(len(data))
-			start += len(data)
+			if len(data) > 0 {
+				if _, err := w.Write(data); err != nil {
+					return
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+				written += int64(len(data))
+			}
+			wireStart += rawLen
 		}
-
 		if written < contentLength {
-			h.Log.Warn("range download ended prematurely",
-				"token", tgutil.TokenHash(token), "written", written, "contentLength", contentLength)
+			h.Log.Warn("range download ended prematurely", "token", tgutil.TokenHash(token), "written", written, "content_length", contentLength)
 		}
 		return
 	}
 
-	// Full-body path. StreamThreads > 1 → parallel workers via orderedWriter;
-	// <= 1 → sequential path (zero overhead).
 	fw := &flushWriter{w: w, f: flusher}
-
-	if threads > 1 {
-		// Cap peak memory at max(threads×chunk, 5 MiB) for true parallel throughput.
-		maxBuffer := max(int64(threads)*StreamChunkSize, 5*1024*1024)
-		ow := newOrderedWriter(dlCtx, fw, maxBuffer)
-		defer ow.Close() // ensure cleanup even if DownloadMedia panics
-		_, dErr := client.DownloadMedia(media, &telegram.DownloadOptions{
-			Buffer:               ow,
-			Threads:              threads,
-			ChunkSize:            StreamChunkSize,
-			Ctx:                  dlCtx,
-			RefetchFileReference: refetch,
-		})
-		if dErr != nil {
-			h.Log.Debug("download media ended", "token", tgutil.TokenHash(token), "threads", threads, "error", dErr)
-			return
-		}
-		return
-	}
-
-	// Sequential path: pipes 1 MiB chunks directly to the ResponseWriter via flushWriter.
-	_, dErr := client.DownloadMedia(media, &telegram.DownloadOptions{
+	_, err := client.DownloadMedia(media, &telegram.DownloadOptions{
 		Buffer:               fw,
+		Threads:              1,
 		ChunkSize:            StreamChunkSize,
 		Ctx:                  dlCtx,
 		RefetchFileReference: refetch,
 	})
-	if dErr != nil {
-		h.Log.Debug("download media ended", "token", tgutil.TokenHash(token), "error", dErr)
-		return
+	if err != nil {
+		h.Log.Debug("sequential media download ended", "token", tgutil.TokenHash(token), "error", err)
 	}
 }
 
-// setCommonHeaders writes Content-Type, Content-Disposition, and cache
-// headers. CORS headers are owned by the gateway's corsMiddleware.
+// setCommonHeaders writes the common file response headers. Gateway middleware
+// owns the CORS headers.
 func (h *Handler) setCommonHeaders(w http.ResponseWriter, rec *store.FileRecord, disposition string) {
 	hdr := w.Header()
 	mime := rec.MimeType
@@ -311,35 +272,76 @@ func (h *Handler) setCommonHeaders(w http.ResponseWriter, rec *store.FileRecord,
 	hdr.Set("X-Content-Type-Options", "nosniff")
 }
 
-// resolveVaultMedia fetches the vault message and returns its media. gogram's
-// GetMessages has no context, so we wrap it in a goroutine and select on ctx
-// to avoid pinning a bot client after the request is cancelled.
-func (h *Handler) resolveVaultMedia(ctx context.Context, c *pool.Client, vaultMsgID int32) (telegram.MessageMedia, error) {
+// resolveVaultMedia fetches the stored message using the selected download
+// client. GetMessages has no context-aware variant; the buffered result channel
+// lets a late lookup exit and the per-client lookup semaphore bounds detached
+// calls after an HTTP timeout.
+func (h *Handler) resolveVaultMedia(ctx context.Context, c *pool.Client, rec *store.FileRecord) (telegram.MessageMedia, error) {
+	if h.Ingester == nil || rec == nil {
+		return nil, ErrVaultMessageMissing
+	}
 	type result struct {
 		msgs []telegram.NewMessage
 		err  error
 	}
+	lookupCtx, cancel := context.WithTimeout(ctx, vaultLookupTimeout)
+	defer cancel()
+	releaseLookup, ok := c.AcquireLookup(lookupCtx)
+	if !ok {
+		return nil, lookupCtx.Err()
+	}
 	ch := make(chan result, 1)
 	go func() {
-		msgs, err := c.GetMessages(h.Ingester.VaultChannelID(), &telegram.SearchOption{IDs: int(vaultMsgID)})
+		defer releaseLookup()
+		msgs, err := c.GetMessages(h.Ingester.VaultChannelID(), &telegram.SearchOption{IDs: int(rec.VaultMsgID)})
 		ch <- result{msgs: msgs, err: err}
 	}()
+
 	select {
-	case r := <-ch:
-		if r.err != nil {
-			return nil, r.err
+	case got := <-ch:
+		if got.err != nil {
+			return nil, got.err
 		}
-		if len(r.msgs) == 0 || r.msgs[0].Message == nil {
-			return nil, errors.New("vault message not found")
+		if len(got.msgs) == 0 || got.msgs[0].Message == nil {
+			return nil, ErrVaultMessageMissing
 		}
-		media := r.msgs[0].Media()
+		msg := &got.msgs[0]
+		media := msg.Media()
 		if media == nil {
-			return nil, errors.New("vault message has no media")
+			return nil, ErrVaultMessageNoMedia
+		}
+		if rec.FileKey != "" && tgutil.FileKey(msg) != rec.FileKey {
+			return nil, ErrVaultRecordMismatch
+		}
+		// FileKey includes document size but photo keys do not. Verify the stored
+		// response length independently so Content-Length cannot describe a
+		// different vault object and leave clients stalled near completion.
+		if actualSize := tgutil.ExtractSize(msg); actualSize <= 0 || actualSize != rec.Size {
+			return nil, ErrVaultRecordMismatch
 		}
 		return media, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	case <-lookupCtx.Done():
+		return nil, lookupCtx.Err()
 	}
+}
+
+func isPermanentVaultError(err error) bool {
+	if errors.Is(err, ErrVaultMessageMissing) || errors.Is(err, ErrVaultMessageNoMedia) || errors.Is(err, ErrVaultRecordMismatch) {
+		return true
+	}
+	var codeErr *gogram.ErrResponseCode
+	if errors.As(err, &codeErr) {
+		return codeErr.Message == "MESSAGE_ID_INVALID" || codeErr.Message == "MESSAGE_DELETED"
+	}
+	var rpcErr *telegram.RpcError
+	if errors.As(err, &rpcErr) {
+		return rpcErr.Message == "MESSAGE_ID_INVALID" || rpcErr.Message == "MESSAGE_DELETED"
+	}
+	return false
+}
+
+func maxNativeInt() int64 {
+	return int64(^uint(0) >> 1)
 }
 
 // --- context plumbing ---
@@ -363,178 +365,18 @@ type flushWriter struct {
 }
 
 func (fw *flushWriter) Write(p []byte) (int, error) {
-	n, e := fw.w.Write(p)
-	if fw.f != nil {
+	n, err := fw.w.Write(p)
+	if err == nil && fw.f != nil {
 		fw.f.Flush()
 	}
-	return n, e
+	return n, err
 }
 
-// StreamChunkSize is the size of each chunk downloaded from Telegram.
-// 1 MiB balances memory usage and throughput.
+// StreamChunkSize is the Telegram transfer chunk size used by FileToLink.
 const StreamChunkSize = 1 << 20
 
-// maxConsecutiveChunkFails is the number of consecutive chunk download failures
-// in the range path before giving up. Each failure means DownloadChunkCtx already
-// exhausted its internal retries (up to 20 attempts with backoff). This cap
-// prevents the HTTP layer from retrying the same failing range indefinitely.
-const maxConsecutiveChunkFails = 3
-
-// orderedWriter adapts gogram's parallel WriteAt (out-of-order chunks) into
-// the sequential io.Writer that http.ResponseWriter requires. It buffers
-// out-of-order chunks in a map keyed by offset, flushes them in-order as the
-// next expected offset arrives, and applies backpressure via a bounded
-// pending-byte budget (maxBuffer). Only used on the full-body path with
-// StreamThreads > 1.
-var _ io.WriterAt = (*orderedWriter)(nil) // compile-time interface check
-
-type orderedWriter struct {
-	w            io.Writer // underlying http.ResponseWriter (sequential)
-	mu           sync.Mutex
-	nextOff      int64 // next byte offset we expect to write to w
-	pending      map[int64][]byte
-	pendingBytes int64
-	maxBuffer    int64
-	notFull      *sync.Cond // signaled when pendingBytes shrinks or on error/close
-	closed       bool
-	err          error         // sticky error: once set, all future WriteAt calls fail
-	closeCh      chan struct{} // signals watchdog goroutine to unblock on Close()
-}
-
-// newOrderedWriter constructs an adapter. When ctx cancels, Close is called
-// automatically so gogram's workers stop fetching promptly.
-func newOrderedWriter(ctx context.Context, w io.Writer, maxBuffer int64) *orderedWriter {
-	ow := &orderedWriter{
-		w:         w,
-		pending:   make(map[int64][]byte),
-		maxBuffer: maxBuffer,
-		closeCh:   make(chan struct{}),
-	}
-	ow.notFull = sync.NewCond(&ow.mu)
-	// Cancel producers the instant the HTTP client disconnects or Close is called.
-	go func() {
-		select {
-		case <-ctx.Done():
-			ow.Close()
-		case <-ow.closeCh:
-		}
-	}()
-	return ow
-}
-
-// WriteAt implements io.WriterAt. Fast path writes straight through when off
-// matches nextOff; otherwise buffers a copy. Backpressure blocks on notFull
-// when pendingBytes >= maxBuffer. The fast path is exempt from backpressure —
-// blocking it would deadlock (chunk 0 drains the buffer).
-func (ow *orderedWriter) WriteAt(p []byte, off int64) (int, error) {
-	ow.mu.Lock()
-	defer ow.mu.Unlock()
-
-	// Fast path: chunk at exactly the expected offset — write straight through.
-	// Must complete before returning (gogram reuses its buffer on return).
-	if off == ow.nextOff {
-		return ow.writeFastPath(p)
-	}
-
-	// Slow path: out-of-order chunk that needs buffering. Backpressure blocks
-	// until space frees or the writer closes/errors.
-	for ow.pendingBytes >= ow.maxBuffer && !ow.closed && ow.err == nil {
-		ow.notFull.Wait()
-	}
-	if ow.closed || ow.err != nil {
-		return 0, ow.err
-	}
-
-	// Re-check fast path after waiting: another writer may have advanced nextOff.
-	if off == ow.nextOff {
-		return ow.writeFastPath(p)
-	}
-
-	// Out of order — buffer a COPY (gogram reuses its slice on return).
-	chunk := make([]byte, len(p))
-	copy(chunk, p)
-	ow.pending[off] = chunk
-	ow.pendingBytes += int64(len(chunk))
-	return len(p), nil
-}
-
-// writeFastPath writes p directly to the underlying writer, then drains
-// contiguous buffered chunks. MUST be called with ow.mu held. On error sets
-// ow.err, broadcasts to wake blocked producers, and propagates the error so
-// gogram's worker exits immediately.
-func (ow *orderedWriter) writeFastPath(p []byte) (int, error) {
-	if ow.closed || ow.err != nil {
-		return 0, ow.err
-	}
-	n, err := ow.w.Write(p)
-	ow.nextOff += int64(n)
-	// Short-write + sticky-error: intentional pattern. Once ow.err is set all
-	// future WriteAt calls fail immediately, preventing silent data loss.
-	if n < len(p) {
-		if err == nil {
-			err = io.ErrShortWrite
-		}
-		ow.err = err
-		ow.notFull.Broadcast() // wake blocked producers so they see ow.err
-		return n, err
-	}
-	if err != nil {
-		ow.err = err
-		ow.notFull.Broadcast() // wake blocked producers
-		return n, err
-	}
-	ow.flushContiguous()
-	// Propagate flushContiguous errors so gogram's worker exits now, not next WriteAt.
-	if ow.err != nil {
-		return n, ow.err
-	}
-	return n, nil
-}
-
-// flushContiguous drains buffered chunks whose offsets now match nextOff.
-// MUST be called with ow.mu held. On error sets ow.err, broadcasts, returns.
-func (ow *orderedWriter) flushContiguous() {
-	for {
-		chunk, ok := ow.pending[ow.nextOff]
-		if !ok {
-			break
-		}
-		delete(ow.pending, ow.nextOff)
-		ow.pendingBytes -= int64(len(chunk))
-		n, err := ow.w.Write(chunk)
-		ow.nextOff += int64(n)
-		if n < len(chunk) {
-			if err == nil {
-				err = io.ErrShortWrite
-			}
-			ow.err = err
-			ow.notFull.Broadcast()
-			return
-		}
-		if err != nil {
-			ow.err = err
-			ow.notFull.Broadcast() // wake ALL blocked producers so they see ow.err
-			return
-		}
-		// Wake one producer blocked on backpressure (one slot freed).
-		ow.notFull.Signal()
-	}
-}
-
-// Close marks the adapter closed and wakes all blocked producers. Sets
-// ow.err = io.ErrClosedPipe so gogram's workers see non-nil and stop fetching
-// (nil would let them treat (0, nil) as a successful zero-byte write). A
-// previously-recorded error is preserved so callers see the root cause.
-func (ow *orderedWriter) Close() error {
-	ow.mu.Lock()
-	defer ow.mu.Unlock()
-	if !ow.closed {
-		ow.closed = true
-		if ow.err == nil {
-			ow.err = io.ErrClosedPipe
-		}
-		ow.notFull.Broadcast() // wake all blocked producers
-		close(ow.closeCh)      // unblock watchdog goroutine
-	}
-	return ow.err
-}
+// maxConsecutiveChunkFails is one because gogram already retries each part
+// internally. Retrying that exhausted cycle at the HTTP layer is what makes a
+// browser appear stuck at 99% instead of receiving a prompt failed transfer
+// that it can reconnect/resume.
+const maxConsecutiveChunkFails = 1

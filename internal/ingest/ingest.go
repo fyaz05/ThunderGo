@@ -35,7 +35,10 @@ type Result struct {
 
 // maxDedupEntries bounds the in-memory dedup mutex map to prevent unbounded
 // memory growth under high file-key churn.
-const maxDedupEntries = 10000
+const (
+	maxDedupEntries        = 10000
+	canonicalLookupTimeout = 30 * time.Second
+)
 
 // Ingester coordinates file ingestion. It is safe for concurrent use.
 type Ingester struct {
@@ -69,6 +72,53 @@ func New(p *pool.Pool, s *store.Store, vaultChannelID int64, log *slog.Logger) *
 
 // VaultChannelID returns the vault channel ID used by the stream handler.
 func (in *Ingester) VaultChannelID() int64 { return in.vaultID }
+
+// validateCanonicalRecord verifies that a record still points at media in the
+// vault and that the vault media has the same stable file key. It deliberately
+// distinguishes a missing/mismatched copy (false, nil) from a transient
+// Telegram failure (false, err): a transient failure must not trigger a new
+// forward and create duplicate vault media.
+func (in *Ingester) validateCanonicalRecord(ctx context.Context, c *pool.Client, rec *store.FileRecord) (bool, error) {
+	if c == nil || rec == nil || rec.VaultMsgID == 0 {
+		return false, nil
+	}
+	type result struct {
+		msgs []telegram.NewMessage
+		err  error
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, canonicalLookupTimeout)
+	defer cancel()
+	releaseLookup, ok := c.AcquireLookup(lookupCtx)
+	if !ok {
+		return false, lookupCtx.Err()
+	}
+	ch := make(chan result, 1)
+	go func() {
+		defer releaseLookup()
+		msgs, err := c.GetMessages(in.VaultChannelID(), &telegram.SearchOption{IDs: int(rec.VaultMsgID)})
+		ch <- result{msgs: msgs, err: err}
+	}()
+
+	select {
+	case got := <-ch:
+		if got.err != nil {
+			return false, got.err
+		}
+		if len(got.msgs) == 0 || got.msgs[0].Message == nil {
+			return false, nil
+		}
+		msg := &got.msgs[0]
+		if !msg.IsMedia() || tgutil.FileKey(msg) != rec.FileKey {
+			return false, nil
+		}
+		if actualSize := tgutil.ExtractSize(msg); actualSize <= 0 || actualSize != rec.Size {
+			return false, nil
+		}
+		return true, nil
+	case <-lookupCtx.Done():
+		return false, lookupCtx.Err()
+	}
+}
 
 // CleanupDedupMu evicts unlocked dedup mutex entries. The DB unique index on
 // file_key prevents duplicates if a concurrent ingest races against cleanup.
@@ -174,27 +224,33 @@ func (in *Ingester) Ingest(ctx context.Context, msg *telegram.NewMessage) Result
 	mu.Lock()
 	defer mu.Unlock()
 
-	if existing, err := in.store.FindFileByKey(ctx, key); err != nil {
-		return Result{Err: fmt.Errorf("checking existing file: %w", err)}
-	} else if existing != nil {
-		// Best-effort reuse-count bump; non-blocking.
-		if incErr := in.store.IncrementReuseCount(ctx, key); incErr != nil {
-			in.log.Debug("incrementing reuse count", "file_key", key, "error", incErr)
-		}
-		in.log.Debug("dedup hit; reusing file record", "file_key", key, "vault_msg_id", existing.VaultMsgID)
-		return Result{File: existing, Reused: true}
-	}
-
 	primary := in.pool.Primary()
 	if primary == nil {
 		return Result{Err: errors.New("no primary client available")}
 	}
 
-	fileName, _ := tgutil.ExtractFileName(msg)
-	mime := tgutil.ExtractMIME(msg)
-	size := tgutil.ExtractSize(msg)
-	dcID := tgutil.ExtractDcID(msg)
-	mediaType := tgutil.MediaType(msg)
+	// FileToLink validates an existing canonical vault copy before reusing it.
+	// Keep the stale record so a successful replacement can preserve its
+	// provenance and counters.
+	var staleExisting *store.FileRecord
+	if existing, err := in.store.FindFileByKey(ctx, key); err != nil {
+		return Result{Err: fmt.Errorf("checking existing file: %w", err)}
+	} else if existing != nil {
+		valid, validateErr := in.validateCanonicalRecord(ctx, primary, existing)
+		if validateErr != nil {
+			return Result{Err: fmt.Errorf("validating existing vault copy: %w", validateErr)}
+		}
+		if valid {
+			if incErr := in.store.IncrementReuseCount(ctx, key); incErr != nil {
+				in.log.Debug("incrementing reuse count", "file_key", key, "error", incErr)
+			}
+			in.log.Debug("dedup hit; reusing verified file record", "file_key", key, "vault_msg_id", existing.VaultMsgID)
+			return Result{File: existing, Reused: true}
+		}
+		staleExisting = existing
+		in.log.Warn("canonical vault copy is stale; replacing", "file_key", key, "vault_msg_id", existing.VaultMsgID)
+	}
+
 	hash := deterministicHash(key)
 
 	// Cross-process ingest lock prevents two bot processes from each creating a
@@ -212,11 +268,20 @@ func (in *Ingester) Ingest(ctx context.Context, msg *telegram.NewMessage) Result
 			case <-ctx.Done():
 				return Result{Err: ctx.Err()}
 			}
-			if existing, _ := in.store.FindFileByKey(ctx, key); existing != nil {
-				if incErr := in.store.IncrementReuseCount(ctx, key); incErr != nil {
-					in.log.Debug("incrementing reuse count (after lock wait)", "file_key", key, "error", incErr)
+			if existing, lookupErr := in.store.FindFileByKey(ctx, key); lookupErr != nil {
+				return Result{Err: fmt.Errorf("checking file after ingest-lock wait: %w", lookupErr)}
+			} else if existing != nil {
+				valid, validateErr := in.validateCanonicalRecord(ctx, primary, existing)
+				if validateErr != nil {
+					return Result{Err: fmt.Errorf("validating file after ingest-lock wait: %w", validateErr)}
 				}
-				return Result{File: existing, Reused: true}
+				if valid {
+					if incErr := in.store.IncrementReuseCount(ctx, key); incErr != nil {
+						in.log.Debug("incrementing reuse count (after lock wait)", "file_key", key, "error", incErr)
+					}
+					return Result{File: existing, Reused: true}
+				}
+				staleExisting = existing
 			}
 			locked, err = in.store.AcquireIngestLock(ctx, key, 60*time.Second)
 			if err != nil {
@@ -231,6 +296,25 @@ func (in *Ingester) Ingest(ctx context.Context, msg *telegram.NewMessage) Result
 		}
 	}
 	defer in.store.ReleaseIngestLock(ctx, key)
+
+	// A different process may have completed ingestion between the earlier
+	// check and lock acquisition. Validate again rather than blindly reusing
+	// its record.
+	if existing, lookupErr := in.store.FindFileByKey(ctx, key); lookupErr != nil {
+		return Result{Err: fmt.Errorf("checking file after ingest lock: %w", lookupErr)}
+	} else if existing != nil {
+		valid, validateErr := in.validateCanonicalRecord(ctx, primary, existing)
+		if validateErr != nil {
+			return Result{Err: fmt.Errorf("validating file after ingest lock: %w", validateErr)}
+		}
+		if valid {
+			if incErr := in.store.IncrementReuseCount(ctx, key); incErr != nil {
+				in.log.Debug("incrementing reuse count (after ingest lock)", "file_key", key, "error", incErr)
+			}
+			return Result{File: existing, Reused: true}
+		}
+		staleExisting = existing
+	}
 
 	// Forward the media to the vault channel. gogram's Forward has no context,
 	// so we wrap it in a deadline-bearing goroutine selecting on the caller's
@@ -247,6 +331,7 @@ func (in *Ingester) Ingest(ctx context.Context, msg *telegram.NewMessage) Result
 		err  error
 	}
 	var vaultMsgID int32
+	var vaultMsg *telegram.NewMessage
 	var fwdErr error
 forwardLoop:
 	for attempt := 0; attempt < 3; attempt++ {
@@ -269,25 +354,56 @@ forwardLoop:
 		select {
 		case fwd := <-fwdCh:
 			if fwd.err == nil && len(fwd.msgs) > 0 && fwd.msgs[0].ID != 0 {
-				vaultMsgID = fwd.msgs[0].ID
-				fwdErr = nil
+				candidate := &fwd.msgs[0]
+				if candidate.IsMedia() && tgutil.FileKey(candidate) == key {
+					vaultMsgID = candidate.ID
+					vaultMsg = candidate
+					fwdErr = nil
+					break forwardLoop
+				}
+				// A non-media or mismatched forward cannot become canonical. Remove
+				// it immediately so a malformed forward does not leak vault rows.
+				if _, delErr := primary.DeleteMessages(vaultPeer, []int32{candidate.ID}); delErr != nil {
+					in.log.Warn("failed to delete invalid forwarded vault message", "vault_msg_id", candidate.ID, "error", delErr)
+				}
+				fwdErr = errors.New("forwarded vault message has missing or mismatched media")
 				break forwardLoop
 			}
 			fwdErr = fwd.err
+			if fwdErr == nil {
+				fwdErr = errors.New("forwarding returned no messages")
+			}
 			var rpcErr *gogram.ErrResponseCode
-			if fwd.err != nil && errors.As(fwd.err, &rpcErr) && strings.HasPrefix(rpcErr.Message, "FLOOD_WAIT") {
+			if errors.As(fwdErr, &rpcErr) && strings.HasPrefix(rpcErr.Message, "FLOOD_WAIT") {
 				break forwardLoop
 			}
 		case <-ctx.Done():
 			return Result{Err: fmt.Errorf("forwarding file to vault (context cancelled): %w", ctx.Err())}
 		}
 	}
-	if vaultMsgID == 0 {
+	if vaultMsgID == 0 || vaultMsg == nil {
 		if fwdErr != nil {
 			return Result{Err: fmt.Errorf("forwarding file to vault after retries: %w", fwdErr)}
 		}
-		return Result{Err: errors.New("forwarding returned no messages after retries")}
+		return Result{Err: errors.New("forwarding returned no valid media message after retries")}
 	}
+
+	// The vault copy is the canonical object that will later be served. Derive
+	// every response-facing field from it, as FileToLink does.
+	fileName, ok := tgutil.ExtractFileName(vaultMsg)
+	if !ok || fileName == "" {
+		fileName = fmt.Sprintf("Thunder_%d.bin", vaultMsgID)
+	}
+	mime := tgutil.ExtractMIME(vaultMsg)
+	size := tgutil.ExtractSize(vaultMsg)
+	if size <= 0 {
+		if _, delErr := primary.DeleteMessages(vaultPeer, []int32{vaultMsgID}); delErr != nil {
+			in.log.Warn("failed to delete zero-size vault message", "vault_msg_id", vaultMsgID, "error", delErr)
+		}
+		return Result{Err: errors.New("forwarded vault media has no usable file size")}
+	}
+	dcID := tgutil.ExtractDcID(vaultMsg)
+	mediaType := tgutil.MediaType(vaultMsg)
 
 	// ChatID may return 0 for private chats on some gogram paths.
 	firstSourceChatID := msg.ChatID()
@@ -310,32 +426,44 @@ forwardLoop:
 		FirstSourceChatID: firstSourceChatID,
 		FirstSourceMsgID:  firstSourceMsgID,
 	}
-	if err := in.store.InsertFile(ctx, *rec); err != nil {
-		// Re-read before deleting: the insert may have committed despite a
-		// transient error — deleting would orphan the record.
+	if staleExisting != nil {
+		// Preserve the lifecycle/provenance fields of the old canonical record,
+		// matching FileToLink's stale-copy replacement behavior.
+		rec.CreatedAt = staleExisting.CreatedAt
+		rec.SeenCount = staleExisting.SeenCount + 1
+		rec.ReuseCount = staleExisting.ReuseCount
+		if staleExisting.FirstSourceChatID != 0 {
+			rec.FirstSourceChatID = staleExisting.FirstSourceChatID
+			rec.FirstSourceMsgID = staleExisting.FirstSourceMsgID
+		}
+	}
+
+	var persistErr error
+	if staleExisting != nil {
+		persistErr = in.store.ReplaceFile(ctx, *rec)
+	} else {
+		persistErr = in.store.InsertFile(ctx, *rec)
+	}
+	if persistErr != nil {
+		// Re-read before deleting: an Insert may have committed despite a
+		// transient response failure. Validate any colliding record before reuse.
 		existing, lookupErr := in.store.FindFileByKey(ctx, key)
-		if lookupErr == nil && existing != nil && existing.VaultMsgID != vaultMsgID {
-			// Another ingester's record is canonical; our vault message is an orphan.
-			in.log.Warn("file record insert collided; reusing existing",
-				"file_key", key, "our_vault_msg_id", vaultMsgID, "existing_vault_msg_id", existing.VaultMsgID)
-			if _, delErr := primary.DeleteMessages(vaultPeer, []int32{vaultMsgID}); delErr != nil {
-				in.log.Warn("failed to delete orphaned vault message",
-					"vault_msg_id", vaultMsgID, "error", delErr)
+		if lookupErr == nil && existing != nil {
+			valid, validateErr := in.validateCanonicalRecord(ctx, primary, existing)
+			if validateErr == nil && valid {
+				if existing.VaultMsgID != vaultMsgID {
+					if _, delErr := primary.DeleteMessages(vaultPeer, []int32{vaultMsgID}); delErr != nil {
+						in.log.Warn("failed to delete orphaned vault message", "vault_msg_id", vaultMsgID, "error", delErr)
+					}
+					return Result{File: existing, Reused: true}
+				}
+				return Result{File: existing, Reused: false}
 			}
-			return Result{File: existing, Reused: true}
 		}
-		if lookupErr == nil && existing != nil && existing.VaultMsgID == vaultMsgID {
-			// Error was a transient response-path failure; the insert committed.
-			in.log.Warn("file record insert reported error but row is present; treating as committed",
-				"file_key", key, "vault_msg_id", vaultMsgID, "insert_error", err)
-			return Result{File: existing, Reused: false}
-		}
-		// Genuine failure — no record exists, delete the orphan vault message.
 		if _, delErr := primary.DeleteMessages(vaultPeer, []int32{vaultMsgID}); delErr != nil {
-			in.log.Warn("failed to delete orphaned vault message",
-				"vault_msg_id", vaultMsgID, "error", delErr)
+			in.log.Warn("failed to delete orphaned vault message", "vault_msg_id", vaultMsgID, "error", delErr)
 		}
-		return Result{Err: fmt.Errorf("inserting file record: %w", err)}
+		return Result{Err: fmt.Errorf("persisting canonical file record: %w", persistErr)}
 	}
 	in.log.Info("file ingested",
 		"file_key", key,

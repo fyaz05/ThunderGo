@@ -21,9 +21,8 @@ Every ThunderGo environment variable. For deployment see [DEPLOYMENT.md](DEPLOYM
 | `TG_OWNER_USER_ID` | **yes** | — | Your Telegram user ID |
 | `TG_MONGO_URI` | **yes** | — | MongoDB connection string |
 | `TG_URL` | **yes** | — | Full public URL (scheme auto-detected) |
-| `TG_EXTRA_BOTS1`, `TG_EXTRA_BOTS2`, ... | no | (none) | Indexed extra bot tokens for parallel downloads |
+| `TG_EXTRA_BOTS1`, `TG_EXTRA_BOTS2`, ... | no | (none) | Indexed extra bot tokens for concurrent independent downloads |
 | `TG_MAX_CONCURRENT_PER_CLIENT` | no | `8` | Max simultaneous downloads per bot client |
-| `TG_STREAM_THREADS` | no | `4` | Parallel download threads per full-body stream (1–8) |
 | `TG_LOG_FILE` | no | (auto) | Log file path (see Storage & Logging) |
 | `TG_PRIVATE_MODE` | no | `false` | Restrict to owner + authorized users |
 | `TG_FORCE_SUB_CHANNEL_ID` | no | `0` | Require users to join a channel first |
@@ -125,7 +124,7 @@ TG_URL=http://localhost:8080          # local testing
 
 ### `TG_EXTRA_BOTS1`, `TG_EXTRA_BOTS2`, ... (indexed)
 
-Additional bot tokens for parallel downloads. Each index holds ONE token — do NOT comma-separate. Each token becomes a download-only client in the pool. **When to set:** primary bot hits FLOOD_WAIT in logs, or you want faster downloads for many users. **If unset:** pool has only the primary client — all downloads go through it.
+Additional bot tokens for concurrent independent downloads. Each index holds ONE token — do NOT comma-separate. Each token becomes a download-only client in the pool. **When to set:** primary bot hits FLOOD_WAIT in logs, or you want faster downloads for many users. **If unset:** pool has only the primary client — all downloads go through it.
 
 ```ini
 TG_EXTRA_BOTS1=123456789:AAA...BBB
@@ -137,22 +136,13 @@ TG_EXTRA_BOTS3=111111111:EEE...FFF
 
 ### `TG_MAX_CONCURRENT_PER_CLIENT`
 
-Max simultaneous downloads per bot client before the pool falls back to least-loaded overall. Lower it (e.g. `4`) if you see FLOOD_WAIT errors. Raise it (e.g. `16`) if your bots have headroom. Must be >= 1. **If unset:** default `8` is a safe middle ground.
+Hard maximum simultaneous downloads per bot client. When every client reaches the cap, new file requests receive a short 503 retry response. Must be >= 1. **If unset:** default `8`.
 
 ```ini
 TG_MAX_CONCURRENT_PER_CLIENT=8
 ```
 
-### `TG_STREAM_THREADS`
 
-Number of parallel download workers gogram spawns per **full-body** stream (i.e. `GET /f/{hash}/{filename}/raw` without a `Range` header). `4` = parallel (default; `1` = sequential). `2`–`8` = parallel chunk downloads via an `orderedWriter` that reassembles bytes in order — typically 2–3x faster for large files. **Range requests always use a single sequential loop.** Must be in `[1, 8]`. **If unset:** `4`.
-
-```ini
-TG_STREAM_THREADS=4    # 2-3x faster large-file downloads
-TG_STREAM_THREADS=1    # best for high-concurrency gateways (many users, different files)
-```
-
-> Do NOT exceed `8` — Telegram per-session flood limits. For gateways serving many users each requesting different files, keep `1` (sequential) so per-client parallelism stays under `TG_MAX_CONCURRENT_PER_CLIENT`.
 
 ---
 
@@ -396,7 +386,6 @@ TG_EXTRA_BOTS1=123456789:AAA...BBB
 TG_EXTRA_BOTS2=987654321:CCC...DDD
 TG_EXTRA_BOTS3=111111111:EEE...FFF
 TG_MAX_CONCURRENT_PER_CLIENT=16
-TG_STREAM_THREADS=4
 ```
 
 Each extra bot must be created via @BotFather and added as admin to the vault channel with "Post Messages" permission.
@@ -444,7 +433,6 @@ On every restart, `thunder.sh` clones the latest code and rebuilds. The `/restar
 | `TG_VAULT_CHANNEL_ID` > -1000000000000 | `TG_VAULT_CHANNEL_ID must be a -100-prefixed channel ID (<= -1000000000000), got %d` |
 | `TG_FORCE_SUB_CHANNEL_ID` != 0 and > -1000000000000 | `TG_FORCE_SUB_CHANNEL_ID must be a -100-prefixed channel ID or 0 (unset), got %d` |
 | `TG_OWNER_USER_ID` == 0 | `TG_OWNER_USER_ID is required` |
-| `TG_STREAM_THREADS` not in `[1, 8]` | `TG_STREAM_THREADS must be in [1, 8], got %d` |
 | `TG_BATCH_CAP` < 1 | (clamped to 50; warning logged on stderr) |
 | `TG_HTTP_PORT` not 0 and not in [1, 65535] | `TG_HTTP_PORT must be 0 or in [1, 65535], got %d` |
 | `TG_MAX_CONCURRENT_PER_CLIENT` < 1 | `TG_MAX_CONCURRENT_PER_CLIENT must be >= 1, got %d` |

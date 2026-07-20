@@ -132,6 +132,16 @@ func TestFileURL_SpecialChars(t *testing.T) {
 	}
 }
 
+func TestFileURL_NormalizesSlashBeforeEscaping(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{BaseURL: "https://example.com"}
+	got := cfg.FileURL("abc123", "dir/movie.mp4")
+	want := "https://example.com/f/abc123/dir_movie.mp4"
+	if got != want {
+		t.Errorf("FileURL = %q, want %q", got, want)
+	}
+}
+
 func setTestEnv(t *testing.T) {
 	t.Helper()
 	vars := map[string]string{
