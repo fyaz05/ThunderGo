@@ -200,6 +200,10 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 	dlCtx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
+	refetch := func() (any, error) {
+		return h.resolveVaultMedia(dlCtx, client, vaultMsgID)
+	}
+
 	if hasRange {
 		// Range path: gogram's DownloadChunkCtx aligns each fetch to a 4096
 		// boundary and trims the excess internally, so we can pass the
@@ -214,6 +218,7 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 		}
 
 		written := int64(0)
+		consecutiveFails := 0
 		for written < contentLength {
 			remaining := contentLength - written
 			chunkEnd := start + StreamChunkSize
@@ -221,12 +226,18 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 				chunkEnd = start + int(remaining)
 			}
 
-			data, _, dErr := client.DownloadChunkCtx(dlCtx, media, start, chunkEnd, StreamChunkSize)
+			data, _, dErr := client.DownloadChunkCtx(dlCtx, media, start, chunkEnd, StreamChunkSize,
+				&telegram.DownloadOptions{RefetchFileReference: refetch})
 			if dErr != nil {
+				consecutiveFails++
 				h.Log.Warn("download chunk failed mid-stream",
-					"token", tgutil.TokenHash(token), "offset", start, "error", dErr)
-				return
+					"token", tgutil.TokenHash(token), "offset", start, "error", dErr, "fails", consecutiveFails)
+				if consecutiveFails >= 3 {
+					return
+				}
+				continue
 			}
+			consecutiveFails = 0
 			if len(data) == 0 {
 				break
 			}
@@ -251,9 +262,6 @@ func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *poo
 	// Full-body path. StreamThreads > 1 → parallel workers via orderedWriter;
 	// <= 1 → sequential path (zero overhead).
 	fw := &flushWriter{w: w, f: flusher}
-	refetch := func() (any, error) {
-		return h.resolveVaultMedia(dlCtx, client, vaultMsgID)
-	}
 
 	if threads > 1 {
 		// Cap peak memory at max(threads×chunk, 5 MiB) for true parallel throughput.
