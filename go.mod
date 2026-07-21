@@ -73,4 +73,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/amarnathcjd/gogram v1.7.7 => github.com/fyaz05/gogram v1.7.8-fix.5
+replace github.com/amarnathcjd/gogram v1.7.7 => github.com/fyaz05/gogram v1.7.8-fix.2
