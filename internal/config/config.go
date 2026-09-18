@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/caarlos0/env/v11"
 )
@@ -63,7 +64,74 @@ type Config struct {
 	// Auto-update (non-Docker)
 	UpstreamRepo   string `env:"UPSTREAM_REPO"`                                // git URL for auto-update on restart
 	UpstreamBranch string `env:"UPSTREAM_BRANCH"            envDefault:"main"` // branch to track
+
+	// --- Stream pipeline knobs (Phase 3) ---
+	//
+	// STREAM_PROFILE selects one of the named presets (basic|medium|high)
+	// for the adaptive windowed download pipeline. The four individual
+	// knobs (CONCURRENCY, BUFFER_COUNT, TIMEOUT_SEC, MAX_RETRIES) are
+	// parsed manually in Load() so that "explicitly set" can be detected
+	// with os.LookupEnv (caarlos0/env cannot express that for ints).
+	// Precedence per knob: explicit env > profile preset > basic defaults.
+	StreamConcurrency int
+	StreamBufferCount int
+	StreamTimeout     time.Duration
+	StreamMaxRetries  int
+
+	// EnableLegacyLinks serves the pre-revival URL shapes (/watch/* and
+	// 2-segment /f/{token} links). When false (default) those routes
+	// answer 410 Gone so old links fail loudly instead of leaking tokens
+	// into logs and search engines.
+	EnableLegacyLinks bool `env:"ENABLE_LEGACY_LINKS"`
 }
+
+// StreamPresetSpec describes one named stream profile preset.
+type StreamPresetSpec struct {
+	Name        string
+	Concurrency int
+	BufferCount int
+	TimeoutSecs int
+	MaxRetries  int
+}
+
+// streamPresets is the named-preset table for the stream pipeline. "basic"
+// doubles as the default when STREAM_PROFILE is unset or when an individual
+// knob needs a fallback.
+var streamPresets = map[string]StreamPresetSpec{
+	"basic":  {Name: "basic", Concurrency: 4, BufferCount: 8, TimeoutSecs: 30, MaxRetries: 3},
+	"medium": {Name: "medium", Concurrency: 6, BufferCount: 12, TimeoutSecs: 45, MaxRetries: 3},
+	"high":   {Name: "high", Concurrency: 8, BufferCount: 16, TimeoutSecs: 60, MaxRetries: 5},
+}
+
+// StreamPreset returns the named preset spec (ok=false for unknown names).
+// Exposed for tests and documentation; production parsing happens in Load.
+func StreamPreset(name string) (StreamPresetSpec, bool) {
+	p, ok := streamPresets[name]
+	return p, ok
+}
+
+// Stream pipeline env-var names, parsed manually in loadStreamProfile.
+const (
+	envStreamConcurrency = "CONCURRENCY"
+	envStreamBufferCount = "BUFFER_COUNT"
+	envStreamTimeoutSec  = "TIMEOUT_SEC"
+	envStreamMaxRetries  = "MAX_RETRIES"
+	envStreamProfile     = "STREAM_PROFILE"
+)
+
+// Stream knob validation bounds. Values below the floor are clamped up,
+// values above the cap are clamped down (with a stderr warning, matching the
+// TG_BATCH_CAP style) so a fat-fingered env cannot wedge the pipeline.
+const (
+	streamConcurrencyFloor = 1
+	streamConcurrencyCap   = 64
+	streamBufferFloor      = 2
+	streamBufferCap        = 128
+	streamTimeoutFloorSecs = 5
+	streamTimeoutCapSecs   = 120
+	streamRetriesFloor     = 0
+	streamRetriesCap       = 10
+)
 
 // Load reads .env files (best-effort), then parses environment variables into a Config.
 func Load(filenames ...string) (*Config, error) {
@@ -93,11 +161,95 @@ func Load(filenames ...string) (*Config, error) {
 		}
 	}
 
+	if err := c.loadStreamProfile(); err != nil {
+		return nil, err
+	}
+
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
 
 	return c, nil
+}
+
+// loadStreamProfile resolves the stream pipeline knobs.
+//
+// Precedence per knob: explicit env (CONCURRENCY / BUFFER_COUNT /
+// TIMEOUT_SEC / MAX_RETRIES) beats the STREAM_PROFILE preset, which beats
+// the "basic" preset values (also the default when STREAM_PROFILE is unset).
+// STREAM_PROFILE is validated fail-fast at Load; the numeric knobs are
+// clamped into their documented bounds.
+func (c *Config) loadStreamProfile() error {
+	profile := "basic"
+	if raw, ok := os.LookupEnv(envStreamProfile); ok && strings.TrimSpace(raw) != "" {
+		profile = strings.ToLower(strings.TrimSpace(raw))
+	}
+	preset, ok := streamPresets[profile]
+	if !ok {
+		return fmt.Errorf("%s must be one of basic|medium|high, got %q", envStreamProfile, profile)
+	}
+
+	if v, ok, err := lookupStreamInt(envStreamConcurrency); err != nil {
+		return err
+	} else if ok {
+		c.StreamConcurrency = clampStream(v, streamConcurrencyFloor, streamConcurrencyCap, envStreamConcurrency)
+	} else {
+		c.StreamConcurrency = preset.Concurrency
+	}
+	if v, ok, err := lookupStreamInt(envStreamBufferCount); err != nil {
+		return err
+	} else if ok {
+		c.StreamBufferCount = clampStream(v, streamBufferFloor, streamBufferCap, envStreamBufferCount)
+	} else {
+		c.StreamBufferCount = preset.BufferCount
+	}
+	if v, ok, err := lookupStreamInt(envStreamTimeoutSec); err != nil {
+		return err
+	} else if ok {
+		c.StreamTimeout = time.Duration(clampStream(v, streamTimeoutFloorSecs, streamTimeoutCapSecs, envStreamTimeoutSec)) * time.Second
+	} else {
+		c.StreamTimeout = time.Duration(preset.TimeoutSecs) * time.Second
+	}
+	if v, ok, err := lookupStreamInt(envStreamMaxRetries); err != nil {
+		return err
+	} else if ok {
+		c.StreamMaxRetries = clampStream(v, streamRetriesFloor, streamRetriesCap, envStreamMaxRetries)
+	} else {
+		c.StreamMaxRetries = preset.MaxRetries
+	}
+	return nil
+}
+
+// lookupStreamInt reads an integer env var. "Present but empty" counts as
+// unset so `.env` files can carry placeholder "KEY=" lines. A present but
+// unparseable value fails fast at Load.
+func lookupStreamInt(key string) (int, bool, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok {
+		return 0, false, nil
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, true, fmt.Errorf("%s must be an integer, got %q", key, raw)
+	}
+	return v, true, nil
+}
+
+// clampStream clamps v into [floor, ceiling] and warns when clamping occurred.
+func clampStream(v, floor, ceiling int, key string) int {
+	if v < floor {
+		fmt.Fprintf(os.Stderr, "WARNING: %s=%d is below the minimum %d; clamping to %d\n", key, v, floor, floor)
+		return floor
+	}
+	if v > ceiling {
+		fmt.Fprintf(os.Stderr, "WARNING: %s=%d is above the maximum %d; clamping to %d\n", key, v, ceiling, ceiling)
+		return ceiling
+	}
+	return v
 }
 
 func (c *Config) validate() error {

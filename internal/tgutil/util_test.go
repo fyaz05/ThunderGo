@@ -225,42 +225,24 @@ func TestSanitizeForDisposition(t *testing.T) {
 	}
 }
 
-// TestNilSafe verifies every exported extractor/key/type function is nil-safe:
-// calling with a nil *telegram.NewMessage must not panic and must return a
-// sensible zero value (D-017).
-func TestNilSafe(t *testing.T) {
+// TestMimeToExt_NilEraHelpers verifies the pure MIME→extension helper that
+// survived the Phase 3 extractor removal. (The gogram-coupled extractors
+// ExtractFileName/ExtractMIME/ExtractSize/ExtractDcID/FileKey/MediaType were
+// deleted; the transport seam's MediaInfo carries name/mime/size/DC now, so
+// there are no nil-message shapes left to guard.)
+func TestMimeToExt_NilEraHelpers(t *testing.T) {
 	t.Parallel()
-	t.Run("ExtractFileName", func(t *testing.T) {
-		name, ok := ExtractFileName(nil)
-		if name != "" || ok {
-			t.Errorf("ExtractFileName(nil) = (%q, %v), want (\"\", false)", name, ok)
+	cases := map[string]string{
+		"video/mp4":   "mp4",
+		"image/jpeg":  "jpg",
+		"":            "",
+		"not/a mime!": "",
+	}
+	for in, want := range cases {
+		if got := mimeToExt(in); got != want {
+			t.Errorf("mimeToExt(%q) = %q, want %q", in, got, want)
 		}
-	})
-	t.Run("ExtractMIME", func(t *testing.T) {
-		if got := ExtractMIME(nil); got != "application/octet-stream" {
-			t.Errorf("ExtractMIME(nil) = %q, want application/octet-stream", got)
-		}
-	})
-	t.Run("ExtractSize", func(t *testing.T) {
-		if got := ExtractSize(nil); got != 0 {
-			t.Errorf("ExtractSize(nil) = %d, want 0", got)
-		}
-	})
-	t.Run("ExtractDcID", func(t *testing.T) {
-		if got := ExtractDcID(nil); got != 0 {
-			t.Errorf("ExtractDcID(nil) = %d, want 0", got)
-		}
-	})
-	t.Run("FileKey", func(t *testing.T) {
-		if got := FileKey(nil); got != "" {
-			t.Errorf("FileKey(nil) = %q, want empty", got)
-		}
-	})
-	t.Run("MediaType", func(t *testing.T) {
-		if got := MediaType(nil); got != "document" {
-			t.Errorf("MediaType(nil) = %q, want document", got)
-		}
-	})
+	}
 }
 
 // TestEncodeBase32_RoundTrip is a table-driven round-trip test for

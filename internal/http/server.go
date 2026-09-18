@@ -67,12 +67,12 @@ func New(cfg *config.Config, p *pool.Pool, s *store.Store, in *ingest.Ingester, 
 		Log:           log,
 		StartedAt:     time.Now(),
 		Templates:     tmpl,
-		streamHandler: stream.New(p, s, in, log),
+		streamHandler: stream.New(cfg, p, s, in, log),
 		keepaliveStop: make(chan struct{}),
 	}
 
 	if primary := p.Primary(); primary != nil {
-		if me, err := primary.GetMe(); err == nil && me != nil {
+		if me, err := primary.Me(context.Background()); err == nil {
 			srv.botUsername = me.Username
 		}
 	}
@@ -96,14 +96,64 @@ func (s *Server) buildRouter() http.Handler {
 	// the web redirect can't burn it before the user opens Telegram.
 	r.Get("/activate/{token}", s.handleActivate)
 
-	// Register HEAD on the player page route so HEAD probes get the same
-	// headers as GET instead of a 405.
+	// Canonical routes (byte-compatible surface — do not reorder handlers
+	// or change their bodies). Register HEAD on the player page route so
+	// HEAD probes get the same headers as GET instead of a 405.
 	r.Get("/f/{token}/{filename}", s.handlePlayerPage)
 	r.Head("/f/{token}/{filename}", s.handlePlayerPage)
 	r.Head("/f/{token}/{filename}/raw", s.handleStream)
 	r.Get("/f/{token}/{filename}/raw", s.handleStream)
 
+	// Legacy URL shapes (pre-revival). When ENABLE_LEGACY_LINKS is off
+	// (default) they answer 410 Gone with a constant body; when on they
+	// serve the same player/stream handlers. The root catch-all above is
+	// NOT legacy — it stays the GitHub redirect either way.
+	legacy := s.legacyRoutes()
+	r.Get("/watch/f/{token}/{filename}", legacy.player)
+	r.Head("/watch/f/{token}/{filename}", legacy.player)
+	r.Head("/watch/f/{token}/{filename}/raw", legacy.raw)
+	r.Get("/watch/f/{token}/{filename}/raw", legacy.raw)
+	r.Get("/watch/{token}", legacy.hash)
+	r.Head("/watch/{token}", legacy.hash)
+	r.Get("/f/{token}", legacy.hash)
+	r.Head("/f/{token}", legacy.hash)
+
 	return r
+}
+
+// legacyHandlers bundles the handlers for the legacy URL shapes.
+type legacyHandlers struct {
+	player http.HandlerFunc // /watch/f/{token}/{filename}
+	raw    http.HandlerFunc // /watch/f/{token}/{filename}/raw
+	hash   http.HandlerFunc // /watch/{token} and /f/{token}
+}
+
+// legacyRoutes returns the handler set for the legacy URL shapes, gated on
+// ENABLE_LEGACY_LINKS: disabled → constant-body 410 Gone (no-store); enabled
+// → serve the canonical player/stream handlers (2-segment shapes render the
+// player page for the hash; missing records 404 inside the handler).
+func (s *Server) legacyRoutes() legacyHandlers {
+	if s.Cfg != nil && s.Cfg.EnableLegacyLinks {
+		return legacyHandlers{
+			player: s.handlePlayerPage,
+			raw:    s.handleStream,
+			hash:   s.handlePlayerPage,
+		}
+	}
+	return legacyHandlers{
+		player: s.handleLegacyGone,
+		raw:    s.handleLegacyGone,
+		hash:   s.handleLegacyGone,
+	}
+}
+
+// handleLegacyGone answers legacy URL shapes when ENABLE_LEGACY_LINKS is
+// off. Constant body, no-store (+ CORS for third-party embedders probing old
+// links); the token never reaches the logs.
+func (s *Server) handleLegacyGone(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	http.Error(w, "Gone", http.StatusGone)
 }
 
 // ListenAndServe starts the HTTP gateway on the configured bind address.
@@ -204,18 +254,24 @@ func (s *Server) logMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// redactPath masks the token in /f/{token}/... and /activate/{token} paths
-// so the access log never persists the bearer credential.
+// redactPath masks the token in /f/{token}/..., /watch/f/{token}/... and
+// /activate/{token} paths so the access log never persists the bearer
+// credential.
 func redactPath(p string) string {
-	if !strings.HasPrefix(p, "/f/") && !strings.HasPrefix(p, "/activate/") {
+	if !strings.HasPrefix(p, "/f/") && !strings.HasPrefix(p, "/watch/f/") && !strings.HasPrefix(p, "/activate/") {
 		return p
 	}
-	// /f/{token}/{filename} → 4 segments; /activate/{token} → 3 segments.
-	parts := strings.SplitN(p, "/", 4)
-	if len(parts) < 3 || parts[2] == "" {
+	// Token segment index after splitting on "/": /f/{token}/... → 2;
+	// /activate/{token} → 2; /watch/f/{token}/... → 3.
+	tokenIdx := 2
+	if strings.HasPrefix(p, "/watch/f/") {
+		tokenIdx = 3
+	}
+	parts := strings.SplitN(p, "/", tokenIdx+2)
+	if len(parts) < tokenIdx+1 || parts[tokenIdx] == "" {
 		return p
 	}
-	parts[2] = tgutil.TokenHash(parts[2])
+	parts[tokenIdx] = tgutil.TokenHash(parts[tokenIdx])
 	return strings.Join(parts, "/")
 }
 
@@ -297,12 +353,12 @@ type ClientStatus struct {
 // handleStatus returns operational telemetry (clients, inflight, uptime).
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	perClient := s.Pool.PerClientInflight()
-	all := s.Pool.All()
+	perDC := s.Pool.PerClientDC()
 	clients := make([]ClientStatus, len(perClient))
 	for i, n := range perClient {
 		dc := 0
-		if i < len(all) && all[i] != nil {
-			dc = all[i].GetDC()
+		if i < len(perDC) {
+			dc = perDC[i]
 		}
 		clients[i] = ClientStatus{Index: i, Inflight: n, DC: dc}
 	}
@@ -331,6 +387,10 @@ func (s *Server) handlePlayerPage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if s.Store == nil {
+		http.NotFound(w, r)
+		return
+	}
 
 	rec, err := s.Store.FindFileByHash(r.Context(), token)
 	if err != nil {
@@ -343,7 +403,13 @@ func (s *Server) handlePlayerPage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	s.renderPlayerPage(w, rec)
+}
 
+// renderPlayerPage executes the player template. X-Robots-Tag keeps players
+// and download pages out of search indexes (mirrors the template's meta tag).
+func (s *Server) renderPlayerPage(w http.ResponseWriter, rec *store.FileRecord) {
+	token := rec.Hash
 	rawURL := s.Cfg.FileRawURL(token, rec.FileName) + "?disposition=inline"
 	downloadURL := s.Cfg.FileRawURL(token, rec.FileName)
 
@@ -359,6 +425,7 @@ func (s *Server) handlePlayerPage(w http.ResponseWriter, r *http.Request) {
 		IsImage:       strings.HasPrefix(rec.MimeType, "image/"),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Robots-Tag", "noindex, nofollow")
 	if err := s.Templates.ExecuteTemplate(w, "player.html", pageData); err != nil {
 		s.Log.Error("rendering player page", "error", err)
 	}

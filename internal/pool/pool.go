@@ -1,324 +1,494 @@
-// Package pool manages a set of independent Telegram bot clients and spreads
-// file transfers across them by picking the least-loaded available client
-// per transfer. Each client has an atomic in-flight counter; the pool installs
-// a FloodHandler on every client that sleeps and retries.
+// Package pool manages a fleet of independent Telegram bot transports and
+// spreads file transfers across them by picking the least-loaded available
+// transport per request. Every slot carries an atomic in-flight counter, a
+// hard per-slot stream cap, a vault-lookup semaphore, and a flood-wait
+// cooldown; the pool itself never queues work — when nothing is available it
+// returns a typed capacity/brownout error so the HTTP layer can answer 503
+// immediately.
+//
+// Phase 3: the fleet is built from tgutil.MTGOTransport (mtgo) clients, one
+// per bot token. The gogram client pool is gone.
 package pool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/amarnathcjd/gogram/telegram"
-
 	"github.com/fyaz05/ThunderGo/internal/config"
+	"github.com/fyaz05/ThunderGo/internal/tgutil"
 )
 
-type Client struct {
-	*telegram.Client
-	Inflight atomic.Int64
+// Compile-time gate: the mtgo transport satisfies the full BotBackend seam,
+// so the pool's primary slot can be handed to the bot/ingest layers as-is.
+var _ tgutil.BotBackend = (*tgutil.MTGOTransport)(nil)
 
-	// lookupSem bounds non-context GetMessages calls. A cancelled HTTP request
-	// cannot stop gogram's lookup immediately, so its permit is held until the
-	// detached call actually returns instead of allowing unbounded goroutines.
-	lookupSem chan struct{}
+// Typed acquire errors. Both are sentinel-wrapped (errors.Is-able) and carry
+// a RetryAfter hint for the HTTP layer.
+var (
+	// ErrPoolCapacity means every healthy slot is at its hard stream cap.
+	// The HTTP layer answers 503 with a short Retry-After rather than
+	// queueing work on an already saturated Telegram session.
+	ErrPoolCapacity = errors.New("pool: all clients at stream capacity")
+	// ErrPoolBrownout means every slot is in flood-wait cooldown. The HTTP
+	// layer answers 503 with the minimum remaining wait (capped).
+	ErrPoolBrownout = errors.New("pool: every client in flood cooldown")
+)
+
+// poolError wraps one of the sentinels above with a Retry-After hint in
+// seconds. Unexported on purpose: the stream layer reads the hint through
+// Pool.BrownoutRetryAfter(), and errors.Is works through Unwrap.
+type poolError struct {
+	sentinel   error
+	retryAfter int // seconds; 0 for capacity (HTTP uses its own default)
 }
 
-// AcquireLookup reserves one bounded vault-lookup slot. A zero-value test
-// Client has no semaphore and intentionally behaves as an unlimited no-op.
-func (c *Client) AcquireLookup(ctx context.Context) (release func(), ok bool) {
-	if c == nil || c.lookupSem == nil {
-		return func() {}, c != nil
+func (e *poolError) Error() string {
+	if e.retryAfter > 0 {
+		return fmt.Sprintf("%v (retry after %ds)", e.sentinel, e.retryAfter)
+	}
+	return e.sentinel.Error()
+}
+
+// Unwrap makes errors.Is(err, ErrPoolCapacity/ErrPoolBrownout) work.
+func (e *poolError) Unwrap() error { return e.sentinel }
+
+// RetryAfter returns the hint in seconds.
+func (e *poolError) RetryAfter() int { return e.retryAfter }
+
+// slot is one fleet member: a transport plus its accounting.
+type slot struct {
+	t        tgutil.Transport
+	index    int
+	inflight atomic.Int64
+
+	// lookupSem bounds vault lookups per slot (cap 1). A cancelled HTTP
+	// request cannot stop an in-flight ResolveMedia instantly, so its
+	// permit is held until the call actually returns instead of allowing
+	// unbounded concurrent lookups on one Telegram session.
+	lookupSem chan struct{}
+
+	// floodUntil is a unix-seconds timestamp: while now < floodUntil the
+	// slot is skipped by AcquireBest. 0 = healthy.
+	floodUntil atomic.Int64
+
+	// consecutiveFloods counts flood reports since the last healthy sweep.
+	consecutiveFloods atomic.Int32
+
+	// dc is the transport's own DC, cached right after Start (no live RPC
+	// on the streaming path). Only written before the pool is published.
+	dc int
+}
+
+// Lease is one admission on a slot. The caller MUST Release it (defer-safe;
+// idempotent).
+type Lease struct {
+	slot     *slot
+	p        *Pool
+	released atomic.Bool
+}
+
+// Transport returns the leased transport.
+func (l *Lease) Transport() tgutil.Transport {
+	if l == nil || l.slot == nil {
+		return nil
+	}
+	return l.slot.t
+}
+
+// DC returns the leased slot's cached own-DC (0 when unknown). The stream
+// pipeline uses it for cross-DC pacing.
+func (l *Lease) DC() int {
+	if l == nil || l.slot == nil {
+		return 0
+	}
+	return l.slot.dc
+}
+
+// Release returns the admission. Idempotent — only the first call decrements
+// the counter.
+func (l *Lease) Release() {
+	if l == nil || l.slot == nil {
+		return
+	}
+	if l.released.CompareAndSwap(false, true) {
+		l.slot.inflight.Add(-1)
+	}
+}
+
+// AcquireLookup reserves one bounded vault-lookup slot on the leased client.
+// A lease without a semaphore (constructed outside New) behaves as an
+// unlimited no-op.
+func (l *Lease) AcquireLookup(ctx context.Context) (release func(), ok bool) {
+	if l == nil || l.slot == nil || l.slot.lookupSem == nil {
+		return func() {}, true
 	}
 	select {
-	case c.lookupSem <- struct{}{}:
+	case l.slot.lookupSem <- struct{}{}:
 		var once sync.Once
-		return func() { once.Do(func() { <-c.lookupSem }) }, true
+		return func() { once.Do(func() { <-l.slot.lookupSem }) }, true
 	case <-ctx.Done():
 		return func() {}, false
 	}
 }
 
+// Pool is the fleet manager.
 type Pool struct {
-	primary *Client
-	all     []*Client
+	slots []*slot // immutable after New; slot[0] is the primary
 
-	// maxConcurrent is a hard simultaneous-stream cap per client. Requests are
-	// rejected by the HTTP layer when every client is at this cap.
+	// maxConcurrent is a hard simultaneous-stream cap per slot. Requests
+	// are rejected by the HTTP layer when every slot is at this cap.
 	maxConcurrent int
-
-	stopped  chan struct{} // closed by Stop() to interrupt flood handler sleeps
-	stopOnce sync.Once     // guards close(stopped) against double-close panic
 
 	// acquireMu serialises AcquireBest so slot selection and reservation
 	// happen atomically.
 	acquireMu sync.Mutex
+
+	log *slog.Logger
+
+	brownoutRetryAfter atomic.Int64 // seconds; set when a brownout error is produced
+
+	sweepMu     sync.Mutex
+	sweepCancel context.CancelFunc
+
+	stopOnce sync.Once
 }
 
-// New creates and connects every client in the pool: one primary (receives
-// updates) plus one secondary per extra token (download-only). Primary failure
-// is fatal; secondary failures are logged and skipped (partial pool usable).
+// New creates and connects the transport fleet: one primary (receives
+// updates) plus one secondary per extra token (download-only). Primary
+// failure is fatal; secondary failures are logged and skipped (partial pool
+// usable). Duplicate tokens anywhere in the fleet are a configuration error
+// and fail fast — two sessions on one bot account corrupt each other's auth
+// state.
+//
+// Each transport is started with the caller-supplied startup ctx (app.go's
+// 30s budget). Sessions persist in MongoDB (database "thundergo") when a
+// Mongo URI is configured; otherwise mtgo's in-memory storage is used.
 func New(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Pool, error) {
-	p := &Pool{
-		stopped: make(chan struct{}),
+	if log == nil {
+		log = slog.Default()
 	}
+	maxConcurrent := 8
 	if cfg.MaxConcurrentPerClient > 0 {
-		p.maxConcurrent = cfg.MaxConcurrentPerClient
-	} else {
-		p.maxConcurrent = 8
+		maxConcurrent = cfg.MaxConcurrentPerClient
+	}
+	p := &Pool{
+		maxConcurrent: maxConcurrent,
+		log:           log,
 	}
 
-	// dispatcher must be initialized.
-	primary, err := startClient(ctx, cfg, log, cfg.BotToken, 0, false, p.stopped)
-	if err != nil {
-		return nil, fmt.Errorf("starting primary client: %w", err)
-	}
-	p.primary = primary
-	p.all = append(p.all, primary)
-
-	// Secondary clients: download-only (no updates, lighter on resources).
-	for i, tok := range cfg.ExtraBots {
-		c, err := startClient(ctx, cfg, log, tok, i+1, true, p.stopped)
+	// Session storage: one shared MongoDB-backed adapter (keyed per
+	// session by SessionName) so every bot keeps its auth keys across
+	// restarts. nil → mtgo in-memory storage (fresh bot login per boot).
+	var storage any
+	if cfg.MongoURI != "" {
+		st, err := tgutil.MongoStorage(cfg.MongoURI, "thundergo")
 		if err != nil {
-			log.Error("failed to start secondary client; skipping", "index", i+1, "error", err)
+			return nil, fmt.Errorf("pool: session storage: %w", err)
+		}
+		storage = st
+	}
+
+	// Duplicate-token check across primary + extras. tgutil.NewMTGOTransport
+	// would happily build two clients on one token and Telegram would
+	// terminate them alternately; fail the build instead.
+	seen := map[string]int{cfg.BotToken: 0}
+	for i, tok := range cfg.ExtraBots {
+		if first, dup := seen[tok]; dup {
+			return nil, fmt.Errorf("pool: duplicate bot token (sessions bot-%02d and bot-%02d)", first, i+1)
+		}
+		seen[tok] = i + 1
+	}
+
+	build := func(token, session string) (tgutil.Transport, error) {
+		t, err := tgutil.NewMTGOTransport(tgutil.MTGOConfig{
+			APIID:       cfg.APIID,
+			APIHash:     cfg.APIHash,
+			BotToken:    token,
+			SessionName: session,
+			Storage:     storage,
+			Log:         log.With("component", session),
+		})
+		if err != nil {
+			return nil, err
+		}
+		if err := t.Start(ctx); err != nil {
+			return nil, err
+		}
+		return t, nil
+	}
+
+	// Primary (session bot-00): failure is fatal.
+	primary, err := build(cfg.BotToken, "bot-00")
+	if err != nil {
+		return nil, fmt.Errorf("starting primary transport: %w", err)
+	}
+	p.slots = append(p.slots, newSlot(primary, 0, maxConcurrent))
+
+	// Secondary fleet (sessions bot-01..): download-only; skip-on-error.
+	for i, tok := range cfg.ExtraBots {
+		t, err := build(tok, fmt.Sprintf("bot-%02d", i+1))
+		if err != nil {
+			log.Error("failed to start secondary transport; skipping", "index", i+1, "error", err)
 			continue
 		}
-		p.all = append(p.all, c)
+		p.slots = append(p.slots, newSlot(t, len(p.slots), maxConcurrent))
 	}
 
-	log.Info("telegram client pool ready", "total_clients", len(p.all), "primary_dc", p.primary.GetDC())
-
+	dcs := make([]int, len(p.slots))
+	for i, s := range p.slots {
+		dcs[i] = s.dc
+	}
+	log.Info("telegram transport fleet ready",
+		"total_transports", len(p.slots),
+		"max_concurrent_per_transport", maxConcurrent,
+		"primary_dc", p.slots[0].dc,
+		"slot_dcs", dcs,
+	)
 	return p, nil
 }
 
-func startClient(ctx context.Context, cfg *config.Config, log *slog.Logger, token string, idx int, noUpdates bool, stopped chan struct{}) (*Client, error) {
-	// Honor TG_DATA_DIR so session files land in /app/data (writable by
-	// appuser) instead of CWD. Fall back to CWD for local dev.
-	dataDir := os.Getenv("TG_DATA_DIR")
-	if dataDir == "" {
-		dataDir = "."
-	} else {
-		info, err := os.Stat(dataDir)
-		if err != nil {
-			return nil, fmt.Errorf("TG_DATA_DIR %q: %w", dataDir, err)
-		}
-		if !info.IsDir() {
-			return nil, fmt.Errorf("TG_DATA_DIR %q is not a directory", dataDir)
-		}
-		if f, err := os.CreateTemp(dataDir, ".tg_write_test"); err != nil {
-			return nil, fmt.Errorf("TG_DATA_DIR %q is not writable: %w", dataDir, err)
-		} else {
-			f.Close()
-			os.Remove(f.Name())
-		}
+// NewForTests builds a pool around pre-built transports instead of dialing
+// Telegram. Cross-package suites (internal/stream) exercise admission,
+// brownout and lease semantics on tgutil.FakeTransport through it; production
+// code must use New. Mirrors the exported test-seam pattern in tgutil
+// (NewFloodWaitTestError & co).
+//
+//nolint:revive // exported test seam; see doc comment
+func NewForTests(ts ...tgutil.Transport) *Pool {
+	p := &Pool{maxConcurrent: 8, log: slog.Default()}
+	for i, t := range ts {
+		p.slots = append(p.slots, newSlot(t, i, 8))
 	}
-	sessionFile := filepath.Join(dataDir, fmt.Sprintf("bot_%02d.session", idx))
-
-	clientCfg := telegram.ClientConfig{
-		AppID:            cfg.APIID,
-		AppHash:          cfg.APIHash,
-		Session:          sessionFile,
-		SessionName:      fmt.Sprintf("bot-%02d", idx),
-		ParseMode:        "HTML",
-		LogLevel:         telegram.LogInfo,
-		NoUpdates:        noUpdates,
-		SleepThresholdMs: 10000,
-		FloodHandler:     makeFloodHandler(log, idx, stopped),
-		CacheSenders:     true, // cache per-DC download senders for speed
-	}
-	c, err := telegram.NewClient(clientCfg)
-	if err != nil {
-		return nil, fmt.Errorf("creating client %d: %w", idx, err)
-	}
-	if err := c.Connect(); err != nil {
-		return nil, fmt.Errorf("connecting client %d: %w", idx, err)
-	}
-
-	// Tighten session file permissions before login for defense-in-depth.
-	// gogram creates the session file lazily; if the file doesn't exist
-	// yet, Chmod returns ENOENT which we skip.
-	if err := os.Chmod(sessionFile, 0o600); err != nil && !os.IsNotExist(err) { //nosec G703
-		log.Warn("chmod session file failed", "client", idx, "file", sessionFile, "error", err)
-	}
-
-	if err := c.LoginBot(token); err != nil {
-		return nil, fmt.Errorf("login client %d: %w", idx, err)
-	}
-
-	// UpdatesGetState activates MTProto push updates; without it, updates queue on the getUpdates side.
-	if !noUpdates {
-		if _, err := c.UpdatesGetState(); err != nil {
-			log.Warn("UpdatesGetState failed; update receiving may be impaired", "client", idx, "error", err)
-		} else {
-			log.Info("update state synced", "client", idx)
-		}
-		// Set "/" as the only command prefix (gogram default is "/!").
-		c.SetCommandPrefixes("/")
-	}
-
-	lookupCap := cfg.MaxConcurrentPerClient
-	if lookupCap < 1 {
-		lookupCap = 8
-	}
-	return &Client{Client: c, lookupSem: make(chan struct{}, lookupCap)}, nil
+	return p
 }
 
-// maxFloodWaitSecs is the upper bound on flood-wait retries. Waits above
-// this are treated as rate limits that need operator intervention rather
-// than something to sleep through.
-const maxFloodWaitSecs = 600
-
-// makeFloodHandler returns a FloodHandler that sleeps for the parsed wait and
-// returns true to retry. Waits over 10 min are not retried. Sleep is interruptible
-// via stopped so shutdown isn't delayed.
-func makeFloodHandler(log *slog.Logger, idx int, stopped <-chan struct{}) func(err error) bool {
-	return func(err error) bool {
-		if err == nil {
-			return false
-		}
-		wait := telegram.GetFloodWait(err)
-		if wait <= 0 {
-			return false
-		}
-		if wait > maxFloodWaitSecs {
-			log.Warn("flood wait too long; not retrying", "client", idx, "wait_secs", wait)
-			return false
-		}
-		log.Warn("flood wait; sleeping", "client", idx, "wait_secs", wait)
-		select {
-		case <-time.After(time.Duration(wait) * time.Second):
-			return true
-		case <-stopped:
-			return false
-		}
+// newSlot builds a slot and caches the transport's own DC right after Start
+// (OwnDC reads the live session without an RPC; only BotBackend carries it).
+func newSlot(t tgutil.Transport, index, lookupCap int) *slot {
+	lookupCap = max(lookupCap, 1)
+	s := &slot{
+		t:         t,
+		index:     index,
+		lookupSem: make(chan struct{}, lookupCap),
 	}
+	if bb, ok := t.(tgutil.BotBackend); ok {
+		s.dc = bb.OwnDC(context.Background())
+	}
+	return s
 }
 
-func (p *Pool) Primary() *Client { return p.primary }
+// Primary returns the primary slot's transport as a BotBackend (nil for an
+// empty pool). The bot and ingest layers run on it.
+func (p *Pool) Primary() tgutil.BotBackend {
+	if len(p.slots) == 0 {
+		return nil
+	}
+	bb, _ := p.slots[0].t.(tgutil.BotBackend)
+	return bb
+}
 
-func (p *Pool) All() []*Client { return p.all }
+// Transport returns slot i's transport (nil when out of range). Test seam.
+func (p *Pool) Transport(i int) tgutil.Transport {
+	if i < 0 || i >= len(p.slots) {
+		return nil
+	}
+	return p.slots[i].t
+}
 
-func (p *Pool) Len() int { return len(p.all) }
+// Len returns the number of live slots.
+func (p *Pool) Len() int { return len(p.slots) }
 
-// AcquireBest finds the least-loaded client under the cap and returns it with
-// an idempotent release callback (caller MUST defer it).
-func (p *Pool) AcquireBest() (c *Client, release func()) {
+// AcquireBest finds the least-loaded non-cooling slot under the hard cap and
+// reserves it (charge-at-exec). Never queues: when nothing qualifies it
+// returns ErrPoolCapacity (all healthy slots full) or ErrPoolBrownout (every
+// slot flood-cooling; check Pool.BrownoutRetryAfter for the hint).
+func (p *Pool) AcquireBest() (*Lease, error) {
 	p.acquireMu.Lock()
 	defer p.acquireMu.Unlock()
 
-	if len(p.all) == 0 {
-		return nil, func() {}
-	}
-
-	// Pass 1: find least-loaded client under the cap.
-	var best *Client
-	var bestCount int64
-	for _, cl := range p.all {
-		n := cl.Inflight.Load()
+	now := time.Now().Unix()
+	var best *slot
+	var bestLoad int64
+	cooling := 0
+	for _, s := range p.slots {
+		if fu := s.floodUntil.Load(); fu > now {
+			cooling++
+			continue
+		}
+		n := s.inflight.Load()
 		if n >= int64(p.maxConcurrent) {
 			continue
 		}
-		if best == nil || n < bestCount {
-			best = cl
-			bestCount = n
-		}
-	}
-	if best == nil {
-		// All clients are at their hard stream cap. The HTTP handler turns
-		// this into a short Retry-After response rather than queueing work on
-		// an already saturated Telegram session.
-		return nil, func() {}
-	}
-
-	best.Inflight.Add(1)
-	var once sync.Once
-	return best, func() { once.Do(func() { best.Inflight.Add(-1) }) }
-}
-
-// Deprecated: prefer AcquireBest for atomic pick+reserve.
-func (p *Pool) Pick() *Client {
-	if len(p.all) == 0 {
-		return nil
-	}
-
-	// Pass 1: find least-loaded client under the cap.
-	var best *Client
-	var bestCount int64
-	for _, c := range p.all {
-		n := c.Inflight.Load()
-		if n >= int64(p.maxConcurrent) {
-			continue
-		}
-		if best == nil || n < bestCount {
-			best = c
-			bestCount = n
+		if best == nil || n < bestLoad {
+			best = s
+			bestLoad = n
 		}
 	}
 	if best != nil {
-		return best
+		best.inflight.Add(1)
+		return &Lease{slot: best, p: p}, nil
 	}
 
-	return nil
+	if len(p.slots) > 0 && cooling == len(p.slots) {
+		// Every slot is flood-cooling → brownout. Report the minimum
+		// remaining wait so the HTTP layer can honour Retry-After.
+		minWait := int64(-1)
+		for _, s := range p.slots {
+			w := s.floodUntil.Load() - now
+			if w < 0 {
+				w = 0
+			}
+			if minWait < 0 || w < minWait {
+				minWait = w
+			}
+		}
+		wait := int(minWait)
+		if wait < 1 {
+			wait = 1
+		}
+		p.brownoutRetryAfter.Store(int64(wait))
+		return nil, &poolError{sentinel: ErrPoolBrownout, retryAfter: wait}
+	}
+	return nil, &poolError{sentinel: ErrPoolCapacity}
 }
 
-// Deprecated: prefer AcquireBest.
-func (p *Pool) Acquire() (c *Client, release func()) {
-	return p.AcquireBest()
+// BrownoutRetryAfter returns the minimum remaining flood-wait (seconds) from
+// the most recent brownout error, or 0 if none was produced yet.
+func (p *Pool) BrownoutRetryAfter() int {
+	return int(p.brownoutRetryAfter.Load())
 }
 
+// maxFloodCooldownSecs bounds flood cooldowns. Waits above this are treated
+// as rate limits needing operator intervention rather than something the
+// pool sleeps through.
+const maxFloodCooldownSecs = 600
+
+// ReportFlood records a FLOOD_WAIT against the slot owning t: the slot stops
+// receiving new admissions until now+min(wait, 600s) elapses (or the sweep
+// resets it). Safe to call with a transport the pool doesn't own (no-op).
+func (p *Pool) ReportFlood(t tgutil.Transport, wait time.Duration) {
+	if t == nil {
+		return
+	}
+	for _, s := range p.slots {
+		if s.t == t {
+			secs := int(wait / time.Second)
+			if secs < 1 {
+				secs = 1
+			}
+			if secs > maxFloodCooldownSecs {
+				secs = maxFloodCooldownSecs
+			}
+			s.floodUntil.Store(time.Now().Unix() + int64(secs))
+			s.consecutiveFloods.Add(1)
+			p.log.Warn("flood cooldown",
+				"slot", s.index,
+				"wait_secs", secs,
+				"consecutive_floods", s.consecutiveFloods.Load(),
+			)
+			return
+		}
+	}
+}
+
+// StartFloodSweep launches the background goroutine that clears expired
+// flood cooldowns (production cadence: 5 minutes). Stopping the pool (or
+// cancelling ctx) stops the sweep. Call once, right after New.
+func (p *Pool) StartFloodSweep(ctx context.Context, every time.Duration) {
+	if every <= 0 {
+		every = 5 * time.Minute
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	p.sweepMu.Lock()
+	p.sweepCancel = cancel
+	p.sweepMu.Unlock()
+	go func() {
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				now := time.Now().Unix()
+				for _, s := range p.slots {
+					if fu := s.floodUntil.Load(); fu != 0 && fu <= now {
+						s.floodUntil.Store(0)
+						s.consecutiveFloods.Store(0)
+						p.log.Debug("flood cooldown expired", "slot", s.index)
+					}
+				}
+			}
+		}
+	}()
+}
+
+func (p *Pool) stopSweep() {
+	p.sweepMu.Lock()
+	cancel := p.sweepCancel
+	p.sweepCancel = nil
+	p.sweepMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// TotalInflight sums every slot's in-flight counter.
 func (p *Pool) TotalInflight() int64 {
 	var total int64
-	for _, c := range p.all {
-		total += c.Inflight.Load()
+	for _, s := range p.slots {
+		total += s.inflight.Load()
 	}
 	return total
 }
 
-// Used by the /status endpoint.
+// PerClientInflight returns the in-flight counters, indexed like the fleet
+// (slot 0 = primary). Used by the /status endpoint and the bot's /stats.
 func (p *Pool) PerClientInflight() []int64 {
-	out := make([]int64, len(p.all))
-	for i, c := range p.all {
-		out[i] = c.Inflight.Load()
+	out := make([]int64, len(p.slots))
+	for i, s := range p.slots {
+		out[i] = s.inflight.Load()
 	}
 	return out
 }
 
-// PerClientDC returns the DC each client is attached to, indexed the same way
-// as PerClientInflight. Used by the bot's /status command.
+// PerClientDC returns each slot's cached own-DC (0 when unknown), indexed the
+// same way as PerClientInflight. Used by the bot's /status command.
 func (p *Pool) PerClientDC() []int {
-	out := make([]int, len(p.all))
-	for i, c := range p.all {
-		out[i] = c.GetDC()
+	out := make([]int, len(p.slots))
+	for i, s := range p.slots {
+		out[i] = s.dc
 	}
 	return out
 }
 
-// Stop stops every client in parallel, context-aware so a stuck client.Stop()
-// cannot hang shutdown past the caller's deadline. Idempotent via sync.Once.
+// Stop stops the flood sweep and every transport in parallel, context-aware
+// so a stuck transport Stop cannot hang shutdown past the caller's deadline.
+// Idempotent via sync.Once.
 func (p *Pool) Stop(ctx context.Context) {
 	p.stopOnce.Do(func() {
-		close(p.stopped)
+		p.stopSweep()
 		var wg sync.WaitGroup
-		for _, c := range p.all {
+		for _, s := range p.slots {
 			wg.Add(1)
-			go func(client *Client) {
+			go func(s *slot) {
 				defer wg.Done()
 				done := make(chan struct{})
 				go func() {
-					_ = client.Terminate()
-					close(done)
+					defer close(done)
+					_ = s.t.Stop()
 				}()
 				select {
 				case <-done:
 				case <-ctx.Done():
-					// Give up waiting; client.Terminate will finish in background.
+					// Give up waiting; Stop will finish in background.
 				}
-			}(c)
+			}(s)
 		}
 		wg.Wait()
 	})

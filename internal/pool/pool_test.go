@@ -2,202 +2,216 @@ package pool
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"io"
 	"log/slog"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/fyaz05/ThunderGo/internal/tgutil"
 )
 
-// These tests exercise the in-flight counter logic of the pool without
-// connecting to Telegram. We construct a *Pool directly (white-box, same
-// package) with fake Clients whose embedded *telegram.Client is nil. The
-// counter methods (Pick, Acquire, TotalInflight, PerClientInflight, Len,
-// All, Primary) never touch the embedded telegram.Client, so a nil
-// pointer is safe. Stop is exercised on an empty pool to avoid the
-// nil-pointer dereference that would occur if client.Stop() were invoked
-// on a fake Client.
+// These tests exercise the fleet logic (least-loaded acquisition, hard cap,
+// flood cooldowns, counters, lifecycle) on tgutil.FakeTransport — no network,
+// no mtgo, no gogram. Pool is constructed white-box (same package): slots are
+// built with the production newSlot helper so counters/semaphores/DC caches
+// match what New would produce.
 
-// fakePool builds a Pool with n fake Clients (nil *telegram.Client). The
-// Inflight counters start at zero. maxConcurrent defaults to 8 (matching
-// production); tests may override it after construction.
-func fakePool(n int) *Pool {
-	p := &Pool{
-		stopped:       make(chan struct{}),
-		maxConcurrent: 8,
-	}
-	for i := 0; i < n; i++ {
-		p.all = append(p.all, &Client{})
-	}
-	if n > 0 {
-		p.primary = p.all[0]
-	}
-	return p
-}
-
-// quietLogger returns a logger that discards all output, keeping the test
-// run free of flood-wait warning spam.
+// quietLogger returns a logger that discards all output.
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// indexOf returns the index of c in s, or -1 if c is nil / not found.
-func indexOf(s []*Client, c *Client) int {
-	if c == nil {
-		return -1
+// fakePool builds a Pool with n FakeTransport slots. maxConcurrent defaults
+// to 8 (matching production); tests may override it after construction.
+func fakePool(n int) *Pool {
+	p := &Pool{
+		maxConcurrent: 8,
+		log:           quietLogger(),
 	}
-	for i, e := range s {
-		if e == c {
-			return i
-		}
+	for i := 0; i < n; i++ {
+		ft := tgutil.NewFakeTransport()
+		ft.FakeDC = i + 2 // distinct DCs for PerClientDC assertions
+		p.slots = append(p.slots, newSlot(ft, i, 8))
 	}
-	return -1
+	return p
 }
 
-// ---------- Pick ----------
+// transportOf returns slot i's transport as *tgutil.FakeTransport.
+func transportOf(t *testing.T, p *Pool, i int) *tgutil.FakeTransport {
+	t.Helper()
+	ft, ok := p.Transport(i).(*tgutil.FakeTransport)
+	if !ok || ft == nil {
+		t.Fatalf("Transport(%d) is not a *tgutil.FakeTransport", i)
+	}
+	return ft
+}
 
-func TestPickLeastLoaded(t *testing.T) {
+// ---------- AcquireBest: least-loaded selection ----------
+
+func TestAcquireBestLeastLoaded(t *testing.T) {
 	t.Parallel()
 	p := fakePool(3)
-	p.all[0].Inflight.Store(5)
-	p.all[1].Inflight.Store(2)
-	p.all[2].Inflight.Store(8)
+	p.slots[0].inflight.Store(5)
+	p.slots[1].inflight.Store(2)
+	p.slots[2].inflight.Store(8)
 
-	got := p.Pick()
-	if got != p.all[1] {
-		t.Errorf("Pick() = client[%d] (inflight=%d); want client[1] (inflight=2)",
-			indexOf(p.all, got), got.Inflight.Load())
+	lease, err := p.AcquireBest()
+	if err != nil {
+		t.Fatalf("AcquireBest() error: %v", err)
+	}
+	defer lease.Release()
+	if lease.slot != p.slots[1] {
+		t.Errorf("AcquireBest() = slot[%d], want slot[1] (least loaded)", lease.slot.index)
+	}
+	if got := p.slots[1].inflight.Load(); got != 3 {
+		t.Errorf("after acquire, inflight = %d, want 3 (was 2, +1)", got)
 	}
 }
 
-func TestPickEmptyPool(t *testing.T) {
-	t.Parallel()
-	p := fakePool(0)
-	if c := p.Pick(); c != nil {
-		t.Errorf("Pick() on empty pool = %v; want nil", c)
-	}
-}
-
-func TestPickAllAtCapacityReturnsNil(t *testing.T) {
+func TestAcquireBestSkipsCoolingSlots(t *testing.T) {
 	t.Parallel()
 	p := fakePool(2)
-	p.maxConcurrent = 2
-	p.all[0].Inflight.Store(2)
-	p.all[1].Inflight.Store(3)
+	// Slot 0 has the lowest load but is flood-cooling; slot 1 must win.
+	p.slots[0].inflight.Store(0)
+	p.slots[0].floodUntil.Store(time.Now().Add(time.Hour).Unix())
+	p.slots[1].inflight.Store(4)
 
-	if got := p.Pick(); got != nil {
-		t.Errorf("Pick() = client[%d]; want nil when every client is at capacity", indexOf(p.all, got))
+	lease, err := p.AcquireBest()
+	if err != nil {
+		t.Fatalf("AcquireBest() error: %v", err)
+	}
+	defer lease.Release()
+	if lease.slot != p.slots[1] {
+		t.Errorf("AcquireBest() = slot[%d], want slot[1] (slot 0 cooling)", lease.slot.index)
 	}
 }
 
-func TestAcquireAllAtCapacityReturnsNil(t *testing.T) {
+// ---------- AcquireBest: hard cap + typed errors ----------
+
+func TestAcquireBestCapacityError(t *testing.T) {
 	t.Parallel()
 	p := fakePool(2)
 	p.maxConcurrent = 1
-	p.all[0].Inflight.Store(1)
-	p.all[1].Inflight.Store(1)
+	p.slots[0].inflight.Store(1)
+	p.slots[1].inflight.Store(1)
 
-	client, release := p.AcquireBest()
-	if client != nil {
-		t.Fatalf("AcquireBest() = %v, want nil when every client is at cap", client)
+	lease, err := p.AcquireBest()
+	if lease != nil {
+		t.Fatalf("AcquireBest() = %v, want nil at capacity", lease)
 	}
-	// The no-client release remains safe for uniform deferred cleanup.
-	release()
+	if !errors.Is(err, ErrPoolCapacity) {
+		t.Errorf("err = %v, want ErrPoolCapacity", err)
+	}
+	var pe *poolError
+	if !errors.As(err, &pe) || pe.RetryAfter() != 0 {
+		t.Errorf("RetryAfter on capacity = %v, want 0", err)
+	}
 }
 
-func TestPickPrefersUnderCap(t *testing.T) {
+func TestAcquireBestBrownoutError(t *testing.T) {
 	t.Parallel()
-	// One client under cap (1 < 8), another far lower but at cap.
-	// Pass 1 must pick the under-cap client even though its raw count
-	// is higher than the at-cap client's.
 	p := fakePool(2)
-	p.maxConcurrent = 8
-	p.all[0].Inflight.Store(0) // at cap? no — 0 < 8
-	p.all[1].Inflight.Store(8) // exactly at cap
+	p.slots[0].floodUntil.Store(time.Now().Add(90 * time.Second).Unix())
+	p.slots[1].floodUntil.Store(time.Now().Add(30 * time.Second).Unix())
 
-	got := p.Pick()
-	if got != p.all[0] {
-		t.Errorf("Pick() = client[%d]; want client[0] (under cap, picked in pass 1)",
-			indexOf(p.all, got))
+	lease, err := p.AcquireBest()
+	if lease != nil {
+		t.Fatalf("AcquireBest() = %v, want nil during brownout", lease)
+	}
+	if !errors.Is(err, ErrPoolBrownout) {
+		t.Errorf("err = %v, want ErrPoolBrownout", err)
+	}
+	// The error carries the minimum remaining wait (30s), and the pool
+	// remembers it for BrownoutRetryAfter.
+	var pe *poolError
+	if !errors.As(err, &pe) || pe.RetryAfter() != 30 {
+		t.Errorf("RetryAfter on brownout = %v, want 30", err)
+	}
+	if got := p.BrownoutRetryAfter(); got != 30 {
+		t.Errorf("BrownoutRetryAfter() = %d, want 30", got)
 	}
 }
 
-// ---------- Acquire / Release ----------
-
-func TestAcquireBumpsCounter(t *testing.T) {
-	t.Parallel()
-	p := fakePool(1)
-	c, release := p.Acquire()
-	if c == nil {
-		t.Fatalf("Acquire() = nil; want client")
-	}
-	if got := c.Inflight.Load(); got != 1 {
-		t.Errorf("after Acquire, Inflight = %d; want 1", got)
-	}
-	release()
-	if got := c.Inflight.Load(); got != 0 {
-		t.Errorf("after release, Inflight = %d; want 0", got)
-	}
-}
-
-func TestAcquirePicksLeastLoaded(t *testing.T) {
-	t.Parallel()
-	p := fakePool(3)
-	p.all[0].Inflight.Store(5)
-	p.all[1].Inflight.Store(2)
-	p.all[2].Inflight.Store(8)
-
-	c, release := p.Acquire()
-	defer release()
-	if c != p.all[1] {
-		t.Fatalf("Acquire() picked client[%d]; want client[1] (least loaded)",
-			indexOf(p.all, c))
-	}
-	if got := p.all[1].Inflight.Load(); got != 3 {
-		t.Errorf("after Acquire, all[1].Inflight = %d; want 3 (was 2, +1)", got)
-	}
-}
-
-func TestAcquireReleaseIdempotent(t *testing.T) {
-	t.Parallel()
-	p := fakePool(1)
-	c, release := p.Acquire()
-	if c == nil {
-		t.Fatalf("Acquire() = nil")
-	}
-	release()
-	release() // must NOT drive counter negative
-	release() // belt and suspenders
-	if got := c.Inflight.Load(); got != 0 {
-		t.Errorf("after triple release, Inflight = %d; want 0 (idempotent)", got)
-	}
-}
-
-func TestAcquireEmptyPool(t *testing.T) {
+func TestAcquireBestEmptyPoolIsCapacity(t *testing.T) {
 	t.Parallel()
 	p := fakePool(0)
-	c, release := p.Acquire()
-	if c != nil {
-		t.Errorf("Acquire() on empty pool = %v; want nil", c)
+	lease, err := p.AcquireBest()
+	if lease != nil {
+		t.Fatalf("AcquireBest() on empty pool = %v, want nil", lease)
 	}
-	// The returned release must be a safe no-op.
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("release() on empty pool panicked: %v", r)
-		}
-	}()
-	release()
+	if !errors.Is(err, ErrPoolCapacity) {
+		t.Errorf("err = %v, want ErrPoolCapacity (an empty fleet is not a brownout)", err)
+	}
 }
 
-func TestAcquireMultipleConcurrentReleases(t *testing.T) {
+func TestAcquireBestNeverBlocks(t *testing.T) {
 	t.Parallel()
-	// Concurrent release calls must collapse via sync.Once — counter
-	// lands at exactly 0, never negative.
+	// Saturate every slot; AcquireBest must return promptly with a typed
+	// error rather than queueing behind the cap.
+	p := fakePool(3)
+	p.maxConcurrent = 2
+	for _, s := range p.slots {
+		s.inflight.Store(2)
+	}
+	done := make(chan struct{})
+	go func() {
+		_, err := p.AcquireBest()
+		if !errors.Is(err, ErrPoolCapacity) {
+			t.Errorf("err = %v, want ErrPoolCapacity", err)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("AcquireBest() blocked at capacity; must fail fast")
+	}
+}
+
+// ---------- Lease.Release ----------
+
+func TestReleaseBumpsCounterDown(t *testing.T) {
+	t.Parallel()
 	p := fakePool(1)
-	c, release := p.Acquire()
-	if c == nil {
-		t.Fatalf("Acquire() = nil")
+	lease, err := p.AcquireBest()
+	if err != nil {
+		t.Fatalf("AcquireBest() error: %v", err)
+	}
+	if got := p.TotalInflight(); got != 1 {
+		t.Fatalf("TotalInflight after acquire = %d, want 1", got)
+	}
+	lease.Release()
+	if got := p.TotalInflight(); got != 0 {
+		t.Errorf("TotalInflight after release = %d, want 0", got)
+	}
+}
+
+func TestReleaseIdempotent(t *testing.T) {
+	t.Parallel()
+	p := fakePool(1)
+	lease, err := p.AcquireBest()
+	if err != nil {
+		t.Fatalf("AcquireBest() error: %v", err)
+	}
+	lease.Release()
+	lease.Release() // must NOT drive counter negative
+	lease.Release() // belt and suspenders
+	if got := p.slots[0].inflight.Load(); got != 0 {
+		t.Errorf("after triple release, inflight = %d, want 0 (idempotent)", got)
+	}
+	// Releasing a nil lease is also safe.
+	var nilLease *Lease
+	nilLease.Release()
+}
+
+func TestReleaseConcurrentIsIdempotent(t *testing.T) {
+	t.Parallel()
+	p := fakePool(1)
+	lease, err := p.AcquireBest()
+	if err != nil {
+		t.Fatalf("AcquireBest() error: %v", err)
 	}
 	const n = 32
 	var wg sync.WaitGroup
@@ -205,251 +219,331 @@ func TestAcquireMultipleConcurrentReleases(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
-			release()
+			lease.Release()
 		}()
 	}
 	wg.Wait()
-	if got := c.Inflight.Load(); got != 0 {
-		t.Errorf("after %d concurrent releases, Inflight = %d; want 0", n, got)
+	if got := p.slots[0].inflight.Load(); got != 0 {
+		t.Errorf("after %d concurrent releases, inflight = %d, want 0", n, got)
 	}
 }
 
-// ---------- TotalInflight / PerClientInflight ----------
+// ---------- Lease.Transport / DC / AcquireLookup ----------
 
-func TestTotalInflight(t *testing.T) {
+func TestLeaseTransportReturnsSlotTransport(t *testing.T) {
 	t.Parallel()
-	p := fakePool(3)
-	p.all[0].Inflight.Store(1)
-	p.all[1].Inflight.Store(2)
-	p.all[2].Inflight.Store(3)
-	if got := p.TotalInflight(); got != 6 {
-		t.Errorf("TotalInflight() = %d; want 6", got)
+	p := fakePool(2)
+	lease, err := p.AcquireBest()
+	if err != nil {
+		t.Fatalf("AcquireBest() error: %v", err)
+	}
+	defer lease.Release()
+	if lease.Transport() != p.slots[0].t {
+		t.Errorf("Transport() != slot 0 transport")
 	}
 }
 
-func TestTotalInflightEmpty(t *testing.T) {
+func TestLeaseDCCachedFromOwnDC(t *testing.T) {
 	t.Parallel()
-	p := fakePool(0)
-	if got := p.TotalInflight(); got != 0 {
-		t.Errorf("TotalInflight() on empty pool = %d; want 0", got)
+	p := fakePool(2)
+	lease, err := p.AcquireBest()
+	if err != nil {
+		t.Fatalf("AcquireBest() error: %v", err)
+	}
+	defer lease.Release()
+	if got := lease.DC(); got != 2 {
+		t.Errorf("DC() = %d, want 2 (FakeTransport default after ownDC cache)", got)
 	}
 }
 
-func TestPerClientInflight(t *testing.T) {
-	t.Parallel()
-	p := fakePool(3)
-	p.all[0].Inflight.Store(10)
-	p.all[1].Inflight.Store(20)
-	p.all[2].Inflight.Store(30)
-	got := p.PerClientInflight()
-	if len(got) != 3 {
-		t.Fatalf("PerClientInflight() len = %d; want 3", len(got))
-	}
-	want := []int64{10, 20, 30}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("PerClientInflight()[%d] = %d; want %d", i, got[i], want[i])
-		}
-	}
-}
-
-func TestPerClientInflightEmpty(t *testing.T) {
-	t.Parallel()
-	p := fakePool(0)
-	got := p.PerClientInflight()
-	if len(got) != 0 {
-		t.Errorf("PerClientInflight() on empty pool len = %d; want 0", len(got))
-	}
-}
-
-// ---------- Len / All / Primary ----------
-
-func TestLenAndAllAndPrimary(t *testing.T) {
-	t.Parallel()
-	p := fakePool(3)
-	if got := p.Len(); got != 3 {
-		t.Errorf("Len() = %d; want 3", got)
-	}
-	all := p.All()
-	if len(all) != 3 {
-		t.Fatalf("All() len = %d; want 3", len(all))
-	}
-	for i, c := range all {
-		if c != p.all[i] {
-			t.Errorf("All()[%d] != all[%d]", i, i)
-		}
-	}
-	if p.Primary() == nil {
-		t.Fatalf("Primary() = nil; want non-nil")
-	}
-	if p.Primary() != p.all[0] {
-		t.Errorf("Primary() != all[0]")
-	}
-}
-
-func TestLenAndPrimaryEmpty(t *testing.T) {
-	t.Parallel()
-	p := fakePool(0)
-	if got := p.Len(); got != 0 {
-		t.Errorf("Len() on empty pool = %d; want 0", got)
-	}
-	if got := p.All(); len(got) != 0 {
-		t.Errorf("All() on empty pool len = %d; want 0", len(got))
-	}
-	if p.Primary() != nil {
-		t.Errorf("Primary() on empty pool = %v; want nil", p.Primary())
-	}
-}
-
-// ---------- Vault lookup limiter ----------
-
-func TestAcquireLookupHonorsContextAndRelease(t *testing.T) {
+func TestLeaseAcquireLookup(t *testing.T) {
 	t.Parallel()
 	p := fakePool(1)
-	p.all[0].lookupSem = make(chan struct{}, 1)
+	lease, err := p.AcquireBest()
+	if err != nil {
+		t.Fatalf("AcquireBest() error: %v", err)
+	}
+	defer lease.Release()
 
-	release, ok := p.all[0].AcquireLookup(context.Background())
+	release, ok := lease.AcquireLookup(context.Background())
 	if !ok {
 		t.Fatal("first AcquireLookup() = false, want true")
 	}
 
+	// The semaphore has capacity 1: a cancelled context must not steal it.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, ok := p.all[0].AcquireLookup(ctx); ok {
-		t.Fatal("AcquireLookup() succeeded with a cancelled context while slot is held")
+	if _, ok := lease.AcquireLookup(ctx); ok {
+		t.Fatal("AcquireLookup() succeeded with cancelled context while slot held")
 	}
 
 	release()
-	release() // release is idempotent
-	release2, ok := p.all[0].AcquireLookup(context.Background())
+	release() // idempotent
+	release2, ok := lease.AcquireLookup(context.Background())
 	if !ok {
 		t.Fatal("AcquireLookup() = false after release, want true")
 	}
 	release2()
 }
 
-// ---------- makeFloodHandler ----------
+// ---------- ReportFlood + sweep ----------
 
-func TestFloodHandlerNilError(t *testing.T) {
+func TestReportFloodSetsCooldownAndSkips(t *testing.T) {
 	t.Parallel()
-	stopped := make(chan struct{})
-	h := makeFloodHandler(quietLogger(), 0, stopped)
-	if h(nil) != false {
-		t.Errorf("flood handler with nil err = true; want false")
+	p := fakePool(2)
+	ft := transportOf(t, p, 0)
+	p.ReportFlood(ft, 60*time.Second)
+
+	if got := p.slots[0].floodUntil.Load(); got == 0 {
+		t.Fatal("floodUntil not set after ReportFlood")
+	}
+	if got := p.slots[0].consecutiveFloods.Load(); got != 1 {
+		t.Errorf("consecutiveFloods = %d, want 1", got)
+	}
+	// Slot 0 cooling → acquisition must land on slot 1.
+	lease, err := p.AcquireBest()
+	if err != nil {
+		t.Fatalf("AcquireBest() error: %v", err)
+	}
+	defer lease.Release()
+	if lease.slot != p.slots[1] {
+		t.Errorf("AcquireBest() = slot[%d], want slot[1] (slot 0 cooling)", lease.slot.index)
 	}
 }
 
-func TestFloodHandlerNonFloodError(t *testing.T) {
+func TestReportFloodCapsWaitAt600s(t *testing.T) {
 	t.Parallel()
-	stopped := make(chan struct{})
-	h := makeFloodHandler(quietLogger(), 0, stopped)
-	err := fmt.Errorf("rpc error: 500 INTERNAL")
-	if h(err) != false {
-		t.Errorf("flood handler with non-flood err = true; want false")
+	p := fakePool(1)
+	p.ReportFlood(transportOf(t, p, 0), time.Hour)
+	remaining := p.slots[0].floodUntil.Load() - time.Now().Unix()
+	if remaining > maxFloodCooldownSecs {
+		t.Errorf("cooldown = %ds, want capped at %ds", remaining, maxFloodCooldownSecs)
 	}
 }
 
-func TestFloodHandlerInterruptible(t *testing.T) {
+func TestReportFloodUnknownTransportIsNoop(t *testing.T) {
 	t.Parallel()
-	// Close the stopped channel first. The handler's select must fire on
-	// <-stopped and return false WITHOUT sleeping for 60 seconds.
-	stopped := make(chan struct{})
-	close(stopped)
-	h := makeFloodHandler(quietLogger(), 0, stopped)
-
-	err := fmt.Errorf("rpc error: 420 FLOOD_WAIT_60")
-	start := time.Now()
-	got := h(err)
-	elapsed := time.Since(start)
-
-	if got != false {
-		t.Errorf("flood handler with closed stopped = %v; want false (interrupted)", got)
-	}
-	if elapsed > time.Second {
-		t.Errorf("flood handler slept %v; want <1s (interrupted by stopped)", elapsed)
+	p := fakePool(1)
+	p.ReportFlood(tgutil.NewFakeTransport(), time.Minute) // not a pool member
+	p.ReportFlood(nil, time.Minute)
+	if p.slots[0].floodUntil.Load() != 0 {
+		t.Errorf("floodUntil set by unknown transport report")
 	}
 }
 
-func TestFloodHandlerOverMaxWait(t *testing.T) {
+func TestFloodSweepExpiresCooldown(t *testing.T) {
 	t.Parallel()
-	// Wait > maxFloodWaitSecs (600) → handler refuses to retry, returns
-	// false immediately, without sleeping (and without depending on the
-	// stopped channel being closed).
-	stopped := make(chan struct{}) // intentionally left open
-	h := makeFloodHandler(quietLogger(), 0, stopped)
-	err := fmt.Errorf("FLOOD_WAIT_3600")
+	p := fakePool(2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.StartFloodSweep(ctx, 10*time.Millisecond)
 
-	start := time.Now()
-	got := h(err)
-	elapsed := time.Since(start)
-
-	if got != false {
-		t.Errorf("flood handler with 3600s wait = true; want false (over max)")
+	// A 1-second cooldown would normally outlive the test; the sweep
+	// must not clear it early.
+	p.ReportFlood(transportOf(t, p, 0), time.Second)
+	time.Sleep(30 * time.Millisecond)
+	if p.slots[0].floodUntil.Load() == 0 {
+		t.Fatal("sweep cleared a still-active cooldown")
 	}
-	if elapsed > time.Second {
-		t.Errorf("flood handler took %v; want <1s (should not sleep)", elapsed)
+
+	// An EXPIRED cooldown must be cleared (and the consecutive counter
+	// reset) by the sweep.
+	p.slots[1].floodUntil.Store(time.Now().Add(-time.Second).Unix())
+	p.slots[1].consecutiveFloods.Store(3)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.slots[1].floodUntil.Load() == 0 && p.slots[1].consecutiveFloods.Load() == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if p.slots[1].floodUntil.Load() != 0 || p.slots[1].consecutiveFloods.Load() != 0 {
+		t.Errorf("sweep did not reset expired cooldown: until=%d floods=%d",
+			p.slots[1].floodUntil.Load(), p.slots[1].consecutiveFloods.Load())
 	}
 }
 
-func TestFloodHandlerZeroWait(t *testing.T) {
+func TestBrownoutRecoversAfterCooldownExpiry(t *testing.T) {
 	t.Parallel()
-	// GetFloodWait returns 0 for an unparseable error → handler returns
-	// false immediately (covers the wait <= 0 branch).
-	stopped := make(chan struct{})
-	h := makeFloodHandler(quietLogger(), 0, stopped)
-	err := fmt.Errorf("FLOOD_WAIT_0") // parses to 0
-	if h(err) != false {
-		t.Errorf("flood handler with FLOOD_WAIT_0 = true; want false (wait <= 0)")
+	p := fakePool(1)
+	p.slots[0].floodUntil.Store(time.Now().Add(10 * time.Second).Unix())
+	if _, err := p.AcquireBest(); !errors.Is(err, ErrPoolBrownout) {
+		t.Fatalf("err = %v, want ErrPoolBrownout while cooling", err)
+	}
+	// Cooldown expires (simulating a sweep without changing the counter
+	// discipline) → acquisition works again.
+	p.slots[0].floodUntil.Store(time.Now().Add(-time.Second).Unix())
+	lease, err := p.AcquireBest()
+	if err != nil {
+		t.Fatalf("AcquireBest() after expiry: %v", err)
+	}
+	lease.Release()
+}
+
+// ---------- Counters ----------
+
+func TestTotalInflight(t *testing.T) {
+	t.Parallel()
+	p := fakePool(3)
+	p.slots[0].inflight.Store(1)
+	p.slots[1].inflight.Store(2)
+	p.slots[2].inflight.Store(3)
+	if got := p.TotalInflight(); got != 6 {
+		t.Errorf("TotalInflight() = %d, want 6", got)
+	}
+}
+
+func TestPerClientInflight(t *testing.T) {
+	t.Parallel()
+	p := fakePool(3)
+	p.slots[0].inflight.Store(10)
+	p.slots[1].inflight.Store(20)
+	p.slots[2].inflight.Store(30)
+	got := p.PerClientInflight()
+	if len(got) != 3 {
+		t.Fatalf("PerClientInflight() len = %d, want 3", len(got))
+	}
+	want := []int64{10, 20, 30}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("PerClientInflight()[%d] = %d, want %d", i, got[i], want[i])
+		}
+	}
+}
+
+func TestPerClientDC(t *testing.T) {
+	t.Parallel()
+	p := fakePool(3)
+	got := p.PerClientDC()
+	if len(got) != 3 {
+		t.Fatalf("PerClientDC() len = %d, want 3", len(got))
+	}
+	for i, want := range []int{2, 3, 4} {
+		if got[i] != want {
+			t.Errorf("PerClientDC()[%d] = %d, want %d", i, got[i], want)
+		}
+	}
+}
+
+// Zero-value Pool must be safe for the stats surfaces the bot reads
+// (bot_test.go builds &pool.Pool{} directly).
+func TestZeroValuePoolStats(t *testing.T) {
+	t.Parallel()
+	var p Pool
+	if got := p.Len(); got != 0 {
+		t.Errorf("Len() = %d, want 0", got)
+	}
+	if got := p.TotalInflight(); got != 0 {
+		t.Errorf("TotalInflight() = %d, want 0", got)
+	}
+	if got := len(p.PerClientInflight()); got != 0 {
+		t.Errorf("PerClientInflight() len = %d, want 0", got)
+	}
+	if got := len(p.PerClientDC()); got != 0 {
+		t.Errorf("PerClientDC() len = %d, want 0", got)
+	}
+	if p.Primary() != nil {
+		t.Errorf("Primary() on empty pool = %v, want nil", p.Primary())
+	}
+	// Stop on a zero-value pool is a no-op (no panic).
+	p.Stop(context.Background())
+}
+
+// ---------- Primary / Transport ----------
+
+func TestPrimaryReturnsBotBackend(t *testing.T) {
+	t.Parallel()
+	p := fakePool(2)
+	primary := p.Primary()
+	if primary == nil {
+		t.Fatal("Primary() = nil, want the slot-0 backend")
+	}
+	if _, ok := primary.(*tgutil.FakeTransport); !ok {
+		t.Errorf("Primary() = %T, want *tgutil.FakeTransport", primary)
+	}
+}
+
+func TestTransportOutOfRange(t *testing.T) {
+	t.Parallel()
+	p := fakePool(1)
+	if p.Transport(-1) != nil || p.Transport(1) != nil || p.Transport(0) == nil {
+		t.Errorf("Transport() out-of-range handling wrong")
 	}
 }
 
 // ---------- Stop ----------
 
-func TestStopIdempotent(t *testing.T) {
+func TestStopStopsAllTransportsIdempotent(t *testing.T) {
 	t.Parallel()
-	// Use an empty pool: Stop only closes `stopped` and iterates over
-	// (no) clients. Calling twice must not panic on double-close
-	// (guarded by stopOnce). A non-empty pool with nil telegram.Client
-	// is unsafe here because client.Stop() would dereference nil.
-	p := fakePool(0)
+	p := fakePool(3)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	p.StartFloodSweep(ctx, time.Hour) // sweep must be stopped by Stop
 	p.Stop(ctx)
-	p.Stop(ctx) // must not panic
+	p.Stop(ctx) // must not panic (idempotent)
 
-	select {
-	case <-p.stopped:
-		// good — closed
-	default:
-		t.Errorf("stopped channel not closed after Stop")
+	for i := range p.slots {
+		ft := transportOf(t, p, i)
+		if len(ft.CallsOf(tgutil.CallStop)) != 1 {
+			t.Errorf("slot %d stop calls = %d, want exactly 1", i, len(ft.CallsOf(tgutil.CallStop)))
+		}
 	}
 }
 
-func TestStopContextCancelled(t *testing.T) {
+func TestStopBoundedByContext(t *testing.T) {
 	t.Parallel()
-	// Even with an already-cancelled context, Stop on an empty pool
-	// must return promptly and close `stopped`.
-	p := fakePool(0)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	p.Stop(ctx) // must not block / panic
-
-	select {
-	case <-p.stopped:
-	default:
-		t.Errorf("stopped channel not closed after Stop with cancelled ctx")
+	p := fakePool(1)
+	ft := transportOf(t, p, 0)
+	// A transport whose Stop never returns must not hang pool.Stop past
+	// the caller's deadline.
+	ft.StopErr = errors.New("stop blocked") // Stop returns the error but a slow transport needs a ctx bound:
+	// FakeTransport.Stop returns immediately; simulate a stuck transport
+	// by wrapping it.
+	slow := &stuckTransport{inner: ft}
+	p.slots[0].t = slow
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	p.Stop(ctx)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("Stop took %v, want bounded by the 100ms ctx", elapsed)
 	}
+}
+
+// stuckTransport wraps a transport with a Stop that never returns.
+type stuckTransport struct{ inner tgutil.Transport }
+
+func (s *stuckTransport) Start(ctx context.Context) error { return s.inner.Start(ctx) }
+
+// Stop blocks forever (testing the ctx bound in Pool.Stop).
+func (s *stuckTransport) Stop() error {
+	<-make(chan struct{})
+	return nil
+}
+func (s *stuckTransport) OnCommand(cmd string, h func(ctx context.Context, m tgutil.IncomingMsg) error) {
+	s.inner.OnCommand(cmd, h)
+}
+func (s *stuckTransport) OnCallback(prefix string, h func(ctx context.Context, q tgutil.CallbackQuery) error) {
+	s.inner.OnCallback(prefix, h)
+}
+func (s *stuckTransport) SendText(ctx context.Context, chatID int64, text string, markup any) error {
+	return s.inner.SendText(ctx, chatID, text, markup)
+}
+func (s *stuckTransport) ResolveMedia(ctx context.Context, chatID int64, msgID int) (tgutil.FileHandle, error) {
+	return s.inner.ResolveMedia(ctx, chatID, msgID)
+}
+func (s *stuckTransport) FetchChunk(ctx context.Context, fh tgutil.FileHandle, offset int64, limit int32) ([]byte, error) {
+	return s.inner.FetchChunk(ctx, fh, offset, limit)
+}
+func (s *stuckTransport) RefreshFileRef(ctx context.Context, fh *tgutil.FileHandle) error {
+	return s.inner.RefreshFileRef(ctx, fh)
 }
 
 // ---------- Concurrency (run under -race) ----------
 
 func TestConcurrentAcquireRelease(t *testing.T) {
 	t.Parallel()
-	// 100 goroutines × 100 Acquire/release cycles across 5 clients.
-	// After all goroutines finish, every Inflight counter must be 0
-	// (idempotent release + matching Acquire/release pairs).
 	p := fakePool(5)
 	const goroutines = 100
 	const cycles = 100
@@ -460,53 +554,59 @@ func TestConcurrentAcquireRelease(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < cycles; j++ {
-				c, release := p.Acquire()
-				if c == nil {
-					t.Errorf("Acquire() = nil; want client")
+				lease, err := p.AcquireBest()
+				if err != nil {
+					t.Errorf("AcquireBest() error: %v", err)
 					return
 				}
-				// Exercise a read under the race detector.
-				_ = c.Inflight.Load()
-				release()
+				_ = lease.Transport()
+				lease.Release()
 			}
 		}()
 	}
 	wg.Wait()
 
 	if got := p.TotalInflight(); got != 0 {
-		t.Errorf("TotalInflight after concurrent test = %d; want 0", got)
+		t.Errorf("TotalInflight after concurrent test = %d, want 0", got)
 	}
 	for i, n := range p.PerClientInflight() {
 		if n != 0 {
-			t.Errorf("PerClientInflight[%d] = %d; want 0", i, n)
+			t.Errorf("PerClientInflight[%d] = %d, want 0", i, n)
 		}
 	}
 }
 
-func TestConcurrentPick(t *testing.T) {
+func TestConcurrentAcquireRespectsHardCap(t *testing.T) {
 	t.Parallel()
-	// Pure Pick() stress — verifies concurrent reads of Inflight are
-	// race-free. Counters are set once before the goroutines start, so
-	// the expected pick (all[0]) is stable.
-	p := fakePool(8)
-	for i := range p.all {
-		p.all[i].Inflight.Store(int64(i)) // 0..7 → all[0] is least loaded
-	}
-	const goroutines = 50
-	const iterations = 1000
+	// Hammer AcquireBest from many goroutines with cap 2: at no point may
+	// a slot's inflight exceed the cap.
+	p := fakePool(3)
+	p.maxConcurrent = 2
+
+	var mu sync.Mutex
+	overflow := 0
 	var wg sync.WaitGroup
-	wg.Add(goroutines)
-	for i := 0; i < goroutines; i++ {
+	wg.Add(64)
+	for i := 0; i < 64; i++ {
 		go func() {
 			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				c := p.Pick()
-				if c == nil {
-					t.Errorf("Pick() = nil")
-					return
+			for j := 0; j < 50; j++ {
+				lease, err := p.AcquireBest()
+				if err != nil {
+					continue // capacity is fine under contention
 				}
+				load := lease.slot.inflight.Load()
+				if load > int64(p.maxConcurrent) {
+					mu.Lock()
+					overflow++
+					mu.Unlock()
+				}
+				lease.Release()
 			}
 		}()
 	}
 	wg.Wait()
+	if overflow > 0 {
+		t.Errorf("hard cap exceeded %d times", overflow)
+	}
 }

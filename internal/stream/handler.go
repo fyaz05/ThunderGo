@@ -1,58 +1,134 @@
 // Package stream implements the HTTP file handler. It resolves a vault copy
-// with the selected Telegram client and pipes its bytes to the HTTP socket
-// without intermediate disk writes.
+// through the leased pool transport and pipes its bytes to the HTTP socket
+// with an adaptive windowed download pipeline — parallel Telegram chunk
+// fetches delivered strictly in order, flushed per chunk, never fully
+// buffered (Phase 3, plan §4).
 package stream
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	gogram "github.com/amarnathcjd/gogram"
-	"github.com/amarnathcjd/gogram/telegram"
-
+	"github.com/fyaz05/ThunderGo/internal/config"
 	"github.com/fyaz05/ThunderGo/internal/ingest"
 	"github.com/fyaz05/ThunderGo/internal/pool"
 	"github.com/fyaz05/ThunderGo/internal/store"
 	"github.com/fyaz05/ThunderGo/internal/tgutil"
 )
 
-// Resolver sentinels separate a permanently stale vault record from a
-// transient Telegram/network failure. A stale record must be evicted; a
-// transient error must not destroy a still-valid public link.
-var (
-	ErrVaultMessageMissing = errors.New("vault message missing")
-	ErrVaultMessageNoMedia = errors.New("vault message has no media")
-	ErrVaultRecordMismatch = errors.New("vault media does not match file record")
+const (
+	// overloadRetryAfterSeconds is the Retry-After for capacity/503 paths.
+	overloadRetryAfterSeconds = 2
+	// brownoutRetryAfterFloor is the minimum Retry-After when the whole
+	// fleet is flood-cooling (the pool's estimate may be lower).
+	brownoutRetryAfterFloor = 5
+	// floodRetryAfterCap caps the Retry-After on 429 responses.
+	floodRetryAfterCap = 60
+	// selfHealTimeout bounds the DeleteFileByHash self-heal call.
+	selfHealTimeout = 5 * time.Second
+	// vaultLookupTimeout bounds one ResolveMedia call.
+	vaultLookupTimeout = 30 * time.Second
+
+	// fetchWithRetry policy (plan §4): StreamMaxRetries attempts with
+	// 100ms doubling backoff capped at 15s; FLOOD_WAIT sleeps
+	// min(wait, cap) and counts against retries; file-reference
+	// expirations refresh + retry within a per-request budget.
+	retryBaseBackoff       = 100 * time.Millisecond
+	retryMaxBackoff        = 15 * time.Second
+	maxRefreshesPerRequest = 3
+	// crossDCPaceDelay paces FetchChunk dispatches when the file lives on
+	// a different DC than the leased slot (avoids cross-DC hammering).
+	crossDCPaceDelay = 25 * time.Millisecond
+
+	// Pipeline defaults when the Handler is built without config.
+	defaultStreamConcurrency = 4
+	defaultStreamBufferCount = 8
+	defaultStreamMaxRetries  = 3
+	defaultStreamTimeout     = 30 * time.Second
 )
 
-const (
-	overloadRetryAfterSeconds = 2
-	vaultLookupTimeout        = 30 * time.Second
-)
+// FileStore is the slice of the metadata store the stream handler needs.
+// *store.Store satisfies it in production (compile-asserted below); tests
+// supply fakes so the serving contract can be pinned without MongoDB.
+type FileStore interface {
+	FindFileByHash(ctx context.Context, hash string) (*store.FileRecord, error)
+	IncrementSeenCount(ctx context.Context, fileKey string) error
+	DeleteFileByHash(ctx context.Context, hash string) error
+}
+
+var _ FileStore = (*store.Store)(nil)
 
 // Handler is the HTTP file-streaming handler.
 type Handler struct {
 	Pool     *pool.Pool
-	Store    *store.Store
+	Store    FileStore
 	Log      *slog.Logger
 	Ingester *ingest.Ingester
+
+	// Stream tuning, wired from config by New (normalized for zero values
+	// so a directly-constructed Handler stays usable).
+	concurrency int
+	bufferCount int
+	timeout     time.Duration
+	maxRetries  int
+
+	// vault caches resolved vault media per file hash so seek-heavy
+	// clients skip repeated ResolveMedia RPCs. nil-safe.
+	vault *vaultCache
 }
 
-// New wires the sequential FileToLink-compatible serving path. One admitted
-// HTTP file request always uses one sequential Telegram download; it never
-// splits a file into parallel Telegram workers.
-func New(p *pool.Pool, s *store.Store, in *ingest.Ingester, log *slog.Logger) *Handler {
-	return &Handler{Pool: p, Store: s, Log: log, Ingester: in}
+// New wires the windowed serving path. One admitted HTTP request leases one
+// pool slot and fetches chunks with up to cfg.StreamConcurrency parallel
+// workers, delivered in order through a StreamBufferCount-slot window.
+func New(cfg *config.Config, p *pool.Pool, s *store.Store, in *ingest.Ingester, log *slog.Logger) *Handler {
+	// A nil *store.Store must not become a typed-nil FileStore interface
+	// (h.Store == nil would be false and the guard in ServeHTTP useless).
+	var fs FileStore
+	if s != nil {
+		fs = s
+	}
+	h := &Handler{Pool: p, Store: fs, Log: log, Ingester: in, vault: newVaultCache()}
+	if cfg != nil {
+		h.concurrency = cfg.StreamConcurrency
+		h.bufferCount = cfg.StreamBufferCount
+		h.timeout = cfg.StreamTimeout
+		h.maxRetries = cfg.StreamMaxRetries
+	}
+	h.concurrency, h.bufferCount, h.maxRetries, h.timeout = normalizeStreamTuning(
+		h.concurrency, h.bufferCount, h.maxRetries, h.timeout)
+	return h
 }
 
-// ServeHTTP resolves a stored file record, reserves one stream ticket on a
-// Telegram client, and serves either metadata or bytes. The ticket is acquired
-// before route-specific work and is released exactly once on every path.
+func normalizeStreamTuning(concurrency, bufferCount, maxRetries int, timeout time.Duration) (int, int, int, time.Duration) {
+	if concurrency < 1 {
+		concurrency = defaultStreamConcurrency
+	}
+	if bufferCount < 2 {
+		bufferCount = defaultStreamBufferCount
+	}
+	if maxRetries < 0 {
+		maxRetries = defaultStreamMaxRetries
+	}
+	if timeout <= 0 {
+		timeout = defaultStreamTimeout
+	}
+	return concurrency, bufferCount, maxRetries, timeout
+}
+
+// ServeHTTP resolves a stored file record, reserves one stream lease on the
+// least-loaded pool transport, and serves either metadata or bytes. The
+// lease is acquired before route-specific work and released exactly once on
+// every path.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	token := tokenFromContext(r.Context())
 	if token == "" {
@@ -69,11 +145,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if h.Store == nil {
+		w.Header().Set("Cache-Control", "no-store")
+		http.NotFound(w, r)
+		return
+	}
 
 	rec, err := h.Store.FindFileByHash(r.Context(), token)
 	if err != nil {
-		h.Log.Error("file lookup failed", "token", tgutil.TokenHash(token), "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.internalError(w, err, "file lookup failed", "token", tgutil.TokenHash(token))
 		return
 	}
 	if rec == nil || rec.Size <= 0 {
@@ -88,30 +168,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.Log.Debug("incrementing seen count", "token", tgutil.TokenHash(token), "error", err)
 	}
 
-	// Match FileToLink's admission lifecycle: choose and reserve a client before
-	// request-specific work. Do not queue work on an already saturated client.
-	client, release := h.Pool.AcquireBest()
-	if client == nil {
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Retry-After", strconv.Itoa(overloadRetryAfterSeconds))
-		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+	// Match FileToLink's admission lifecycle: choose and reserve a transport
+	// before request-specific work. Do not queue work on a saturated fleet.
+	lease, err := h.Pool.AcquireBest()
+	if err != nil {
+		h.serveUnavailable(w, err)
 		return
 	}
-	defer release()
+	defer lease.Release()
 
 	rng, hasRange, err := tgutil.ParseRange(r.Header.Get("Range"), rec.Size)
 	if err != nil {
+		w.Header().Set("Cache-Control", "no-store")
 		if errors.Is(err, tgutil.ErrUnsatisfiableRange) {
 			w.Header().Set("Content-Range", tgutil.UnsatisfiableContentRange(rec.Size))
 			http.Error(w, "Range Not Satisfiable", http.StatusRequestedRangeNotSatisfiable)
 			return
 		}
-		w.Header().Set("Cache-Control", "no-store")
+		// Malformed Range: constant body, the input is never reflected.
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
 	if hasRange && rng.Start == 0 && rng.End == rec.Size-1 {
-		hasRange = false
+		hasRange = false // full-range request collapses to a plain 200
 	}
 
 	var contentLength int64
@@ -123,16 +202,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		contentLength = rec.Size
 	}
 
-	// DownloadChunkCtx accepts int offsets. Reject an unsupported Range before
-	// headers are committed, rather than trying to write an HTTP error mid-body.
-	if hasRange && (rng.Start > maxNativeInt() || rng.End > maxNativeInt()) {
-		w.Header().Set("Cache-Control", "no-store")
-		http.Error(w, "file range is unsupported on this build", http.StatusInternalServerError)
-		return
-	}
-
-	// HEAD intentionally uses stored metadata only, as FileToLink does. It still
-	// owns a short-lived stream ticket so load accounting remains consistent.
+	// HEAD intentionally uses stored metadata only, as FileToLink does. It
+	// still owns a stream lease so load accounting remains consistent, and
+	// returns identical headers incl. Content-Length/Content-Range.
 	if r.Method == http.MethodHead {
 		h.setCommonHeaders(w, rec, tgutil.QueryDisposition(r))
 		w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
@@ -143,118 +215,739 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve and validate the vault media with the same client that will
-	// download it. This supplies a fresh file reference for that Telegram
-	// session and prevents a corrupt DB row from serving unrelated media.
-	media, err := h.resolveVaultMedia(r.Context(), client, rec)
+	// Resolve and validate the vault media with the same transport that
+	// will download it. This supplies a fresh file reference for that
+	// Telegram session and prevents a corrupt DB row from serving
+	// unrelated media.
+	fh, err := h.resolveVaultMedia(r.Context(), lease, rec)
 	if err != nil {
-		w.Header().Set("Cache-Control", "no-store")
-		if isPermanentVaultError(err) {
-			h.Log.Warn("stale vault file record", "token", tgutil.TokenHash(token), "vault_msg_id", rec.VaultMsgID, "error", err)
-			deleteCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if delErr := h.Store.DeleteFileByHash(deleteCtx, token); delErr != nil {
-				h.Log.Debug("could not delete stale file record", "token", tgutil.TokenHash(token), "error", delErr)
-			}
-			cancel()
-			http.NotFound(w, r)
-			return
-		}
-		h.Log.Warn("transient vault media error", "token", tgutil.TokenHash(token), "error", err)
-		w.Header().Set("Retry-After", strconv.Itoa(overloadRetryAfterSeconds))
-		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+		h.vault.invalidate(rec.Hash)
+		h.serveResolveError(w, r, token, rec, lease, err)
 		return
 	}
 
+	// Wire window: round the requested start down to a chunk boundary of
+	// the served range's tier so Telegram fetches stay 4KiB-aligned. The
+	// leading bytes are discarded at emit time — the network fetch is NOT
+	// skipped (that's what makes it resume-at-offset for the transport).
+	streamEnd := rec.Size - 1
+	if hasRange {
+		streamEnd = rng.End
+	}
+	tier := int64(chunkSizeFor(contentLength))
+	wireStart := (rng.Start / tier) * tier
+	skip := rng.Start - wireStart
+
+	pipe := h.newPipeline(r.Context(), lease, fh, wireStart, streamEnd)
+	defer pipe.close()
+
+	// Probe the FIRST chunk before committing the response headers: a
+	// total failure with zero bytes written can then be answered with a
+	// real status (429/503/404/500) instead of a truncated 200.
+	first, ok := pipe.next()
+	if !ok {
+		h.internalError(w, errors.New("stream: empty chunk plan"), "empty chunk plan", "token", tgutil.TokenHash(token))
+		return
+	}
+	if first.err != nil {
+		pipe.abort()
+		h.servePipelineError(w, r, token, rec, lease, first.err)
+		return
+	}
+
+	// Header DISCIPLINE: every header below is set before WriteHeader.
 	h.setCommonHeaders(w, rec, tgutil.QueryDisposition(r))
 	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
 	if hasRange {
 		w.Header().Set("Content-Range", tgutil.ContentRangeValue(rng, rec.Size))
 	}
 	w.WriteHeader(status)
-	h.streamBody(w, r, client, media, rec, token, hasRange, rng, contentLength)
-}
 
-// streamBody sends the requested bytes sequentially. It relies on the request
-// context plus gogram's per-RPC timeouts/retries; there is deliberately no
-// short whole-transfer deadline that can truncate a healthy slow large file.
-func (h *Handler) streamBody(w http.ResponseWriter, r *http.Request, client *pool.Client, media telegram.MessageMedia, rec *store.FileRecord, token string, hasRange bool, rng tgutil.Range, contentLength int64) {
 	flusher, _ := w.(http.Flusher)
-	dlCtx := r.Context()
-	refetch := func() (any, error) {
-		return h.resolveVaultMedia(dlCtx, client, rec)
+	fw := &flushWriter{w: w, f: flusher}
+	written := int64(0)
+
+	emit := func(data []byte) bool {
+		if int64(len(data)) > contentLength-written {
+			data = data[:contentLength-written] // clamp (defensive; the plan is exact)
+		}
+		n, werr := fw.Write(data)
+		written += int64(n)
+		return werr == nil
+	}
+	trimSkip := func(data []byte) ([]byte, bool) {
+		if skip <= 0 {
+			return data, true
+		}
+		if int64(len(data)) <= skip {
+			skip -= int64(len(data))
+			return nil, true
+		}
+		data = data[skip:]
+		skip = 0
+		return data, true
 	}
 
-	if hasRange {
-		// Match FileToLink's serving method: Telegram is read in 1 MiB
-		// chunk-aligned windows, then leading/trailing bytes are trimmed for
-		// the exact HTTP range. Besides matching PyroFork stream_media(), this
-		// keeps CDN requests on the same stable chunk boundaries as its hashes.
-		wireStart := int((rng.Start / StreamChunkSize) * StreamChunkSize)
-		skip := int(rng.Start - int64(wireStart))
-		written := int64(0)
-		consecutiveFails := 0
-		for written < contentLength {
-			if int64(wireStart) > maxNativeInt()-int64(StreamChunkSize) {
-				h.Log.Warn("range offset overflow before chunk fetch", "token", tgutil.TokenHash(token), "offset", wireStart)
-				return
-			}
-			wireEnd := wireStart + StreamChunkSize
-			raw, _, dErr := client.DownloadChunkCtx(dlCtx, media, wireStart, wireEnd, StreamChunkSize,
-				&telegram.DownloadOptions{RefetchFileReference: refetch})
-			if dErr != nil {
-				consecutiveFails++
-				h.Log.Warn("range chunk failed", "token", tgutil.TokenHash(token), "offset", wireStart, "error", dErr, "fails", consecutiveFails)
-				if consecutiveFails >= maxConsecutiveChunkFails {
-					return
-				}
-				continue
-			}
-			consecutiveFails = 0
-			if len(raw) == 0 {
-				break
-			}
+	firstData, _ := trimSkip(first.data)
+	if len(firstData) > 0 && !emit(firstData) {
+		return // client went away; nothing left to answer
+	}
 
-			rawLen := len(raw)
-			if skip >= rawLen {
-				skip -= rawLen
-				wireStart += rawLen
-				continue
-			}
-			data := raw[skip:]
-			skip = 0
-			remaining := contentLength - written
-			if int64(len(data)) > remaining {
-				data = data[:remaining]
-			}
-			if len(data) > 0 {
-				if _, err := w.Write(data); err != nil {
-					return
-				}
-				if flusher != nil {
-					flusher.Flush()
-				}
-				written += int64(len(data))
-			}
-			wireStart += rawLen
+	// Ordered emit loop: every subsequent chunk is written as its turn
+	// comes. Any failure after the first byte → truncate (clients resume
+	// with Range); never write an error body mid-stream.
+	for {
+		res, ok := pipe.next()
+		if !ok {
+			break
 		}
-		if written < contentLength {
-			h.Log.Warn("range download ended prematurely", "token", tgutil.TokenHash(token), "written", written, "content_length", contentLength)
+		if res.err != nil {
+			h.Log.Warn("stream ended early",
+				"token", tgutil.TokenHash(token),
+				"written", written,
+				"content_length", contentLength,
+				"error", res.err)
+			return
 		}
+		data, _ := trimSkip(res.data)
+		if len(data) > 0 && !emit(data) {
+			return
+		}
+	}
+	if written < contentLength {
+		h.Log.Warn("download ended prematurely",
+			"token", tgutil.TokenHash(token),
+			"written", written,
+			"content_length", contentLength)
+	}
+}
+
+// --- error mapping (plan §8) ---
+
+// serveUnavailable maps AcquireBest failures onto 503 responses:
+// Retry-After 2 for capacity, the brownout estimate (floor 5s) when the
+// whole fleet is flood-cooling. Constant bodies; never queue.
+func (h *Handler) serveUnavailable(w http.ResponseWriter, err error) {
+	w.Header().Set("Cache-Control", "no-store")
+	if errors.Is(err, pool.ErrPoolBrownout) {
+		ra := h.Pool.BrownoutRetryAfter()
+		if ra < brownoutRetryAfterFloor {
+			ra = brownoutRetryAfterFloor
+		}
+		if ra > maxFloodCooldownSecs {
+			ra = maxFloodCooldownSecs
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(ra))
+		h.Log.Warn("pool brownout; every transport flood-cooling", "retry_after", ra, "error", err)
+	} else {
+		w.Header().Set("Retry-After", strconv.Itoa(overloadRetryAfterSeconds))
+		h.Log.Warn("pool at capacity", "error", err)
+	}
+	http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+}
+
+// maxFloodCooldownSecs mirrors the pool's cooldown cap for Retry-After math.
+const maxFloodCooldownSecs = 600
+
+// serveResolveError maps resolveVaultMedia failures (headers not committed):
+// flood → ReportFlood + 503 with Retry-After from the wait (min 2);
+// permanent → self-heal delete + 404; transient → 503; other → 500.
+func (h *Handler) serveResolveError(w http.ResponseWriter, r *http.Request, token string, rec *store.FileRecord, lease *pool.Lease, err error) {
+	if r.Context().Err() != nil {
+		return // client gone; nothing to answer
+	}
+	if wait, isFlood := tgutil.MapFloodWait(err); isFlood {
+		if t := lease.Transport(); t != nil {
+			h.Pool.ReportFlood(t, time.Duration(wait)*time.Second)
+		}
+		ra := wait
+		if ra < overloadRetryAfterSeconds {
+			ra = overloadRetryAfterSeconds
+		}
+		if ra > maxFloodCooldownSecs {
+			ra = maxFloodCooldownSecs
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", strconv.Itoa(ra))
+		h.Log.Warn("vault lookup flood-limited", "token", tgutil.TokenHash(token), "wait_secs", wait)
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	if tgutil.Classify(err) == tgutil.ErrClassPermanent {
+		h.Log.Warn("stale vault file record",
+			"token", tgutil.TokenHash(token),
+			"vault_msg_id", rec.VaultMsgID,
+			"error", err)
+		h.deleteRecord(token)
+		w.Header().Set("Cache-Control", "no-store")
+		http.NotFound(w, r)
+		return
+	}
+	if tgutil.Classify(err) == tgutil.ErrClassTransient {
+		h.Log.Warn("transient vault media error", "token", tgutil.TokenHash(token), "error", err)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", strconv.Itoa(overloadRetryAfterSeconds))
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	h.internalError(w, err, "vault media resolve failed", "token", tgutil.TokenHash(token))
+}
 
-	fw := &flushWriter{w: w, f: flusher}
-	_, err := client.DownloadMedia(media, &telegram.DownloadOptions{
-		Buffer:               fw,
-		Threads:              1,
-		ChunkSize:            StreamChunkSize,
-		Ctx:                  dlCtx,
-		RefetchFileReference: refetch,
-	})
-	if err != nil {
-		h.Log.Debug("sequential media download ended", "token", tgutil.TokenHash(token), "error", err)
+// servePipelineError maps a first-chunk pipeline failure (still zero bytes
+// written, headers not committed). Flood exhaustion → 429 with a capped
+// wait estimate; permanent → self-heal + 404; transient → 503; else 500.
+func (h *Handler) servePipelineError(w http.ResponseWriter, r *http.Request, token string, rec *store.FileRecord, lease *pool.Lease, err error) {
+	if r.Context().Err() != nil {
+		return // client gone; nothing to answer
+	}
+	if wait, isFlood := tgutil.MapFloodWait(err); isFlood {
+		if t := lease.Transport(); t != nil {
+			h.Pool.ReportFlood(t, time.Duration(wait)*time.Second)
+		}
+		ra := wait
+		if ra < overloadRetryAfterSeconds {
+			ra = overloadRetryAfterSeconds
+		}
+		if ra > floodRetryAfterCap {
+			ra = floodRetryAfterCap
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", strconv.Itoa(ra))
+		h.Log.Warn("stream flood-limited before first byte",
+			"token", tgutil.TokenHash(token), "wait_secs", wait)
+		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
+	}
+	if tgutil.Classify(err) == tgutil.ErrClassPermanent {
+		h.Log.Warn("vault media went stale during stream start",
+			"token", tgutil.TokenHash(token),
+			"vault_msg_id", rec.VaultMsgID,
+			"error", err)
+		h.vault.invalidate(token)
+		h.deleteRecord(token)
+		w.Header().Set("Cache-Control", "no-store")
+		http.NotFound(w, r)
+		return
+	}
+	if tgutil.Classify(err) == tgutil.ErrClassTransient {
+		h.Log.Warn("transient stream start failure", "token", tgutil.TokenHash(token), "error", err)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", strconv.Itoa(overloadRetryAfterSeconds))
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	h.internalError(w, err, "stream start failed", "token", tgutil.TokenHash(token))
+}
+
+// deleteRecord self-heals a permanently stale file record. Detached 5s ctx:
+// the record must be deleted even though the request context may already be
+// failing.
+func (h *Handler) deleteRecord(token string) {
+	deleteCtx, cancel := context.WithTimeout(context.Background(), selfHealTimeout)
+	defer cancel()
+	if err := h.Store.DeleteFileByHash(deleteCtx, token); err != nil {
+		h.Log.Debug("could not delete stale file record", "token", tgutil.TokenHash(token), "error", err)
 	}
 }
+
+// internalError answers 500 with a constant body carrying a random support
+// id (16 hex chars from 8 crypto/rand bytes); the full error is logged with
+// the same id for correlation. no-store + CORS so proxies and browsers never
+// cache an error, and third-party players still see the failure.
+func (h *Handler) internalError(w http.ResponseWriter, err error, msg string, args ...any) {
+	id := supportID()
+	h.Log.Error(msg, append(args, "support_id", id, "error", err)...)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	http.Error(w, "internal error (support id: "+id+")", http.StatusInternalServerError)
+}
+
+// supportID returns 16 hex chars of 8 crypto/rand bytes.
+func supportID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failing is extraordinary; derive a unique-enough
+		// id from the clock rather than failing the response.
+		binary.BigEndian.PutUint64(b[:], uint64(time.Now().UnixNano()))
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// --- vault media resolution ---
+
+// resolveVaultMedia returns a validated FileHandle for the record's vault
+// message, resolved on the leased transport (same session will download it)
+// and guarded by the per-slot lookup semaphore. Results are TTL-cached per
+// file hash so seeks skip repeated lookups.
+//
+// Validation note: FileHandle carries no FileKey, so the legacy key
+// comparison is gone — (vault msg ID + record hash + exact size match) is
+// the identity check now. The size check also guards Content-Length against
+// describing a different vault object.
+func (h *Handler) resolveVaultMedia(ctx context.Context, lease *pool.Lease, rec *store.FileRecord) (tgutil.FileHandle, error) {
+	if rec == nil {
+		return tgutil.FileHandle{}, tgutil.ErrStaleMedia
+	}
+	now := time.Now()
+	if fh, ok := h.vault.get(rec.Hash, now); ok {
+		return fh, nil
+	}
+	if h.Ingester == nil {
+		return tgutil.FileHandle{}, tgutil.ErrStaleMedia
+	}
+	type result struct {
+		fh  tgutil.FileHandle
+		err error
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, vaultLookupTimeout)
+	defer cancel()
+	releaseLookup, ok := lease.AcquireLookup(lookupCtx)
+	if !ok {
+		return tgutil.FileHandle{}, lookupCtx.Err()
+	}
+	ch := make(chan result, 1)
+	go func() {
+		defer releaseLookup()
+		fh, err := lease.Transport().ResolveMedia(lookupCtx, h.Ingester.VaultChannelID(), int(rec.VaultMsgID))
+		ch <- result{fh: fh, err: err}
+	}()
+
+	select {
+	case got := <-ch:
+		if got.err != nil {
+			return tgutil.FileHandle{}, got.err
+		}
+		if got.fh.Location == nil {
+			return tgutil.FileHandle{}, tgutil.ErrStaleMedia
+		}
+		if got.fh.Size <= 0 || got.fh.Size != rec.Size {
+			return tgutil.FileHandle{}, tgutil.ErrRecordMismatch
+		}
+		h.vault.put(rec.Hash, got.fh, now)
+		return got.fh, nil
+	case <-lookupCtx.Done():
+		return tgutil.FileHandle{}, lookupCtx.Err()
+	}
+}
+
+// --- vault TTL cache ---
+
+const (
+	vaultCacheTTL      = 5 * time.Minute
+	vaultCacheCapacity = 1024
+)
+
+type vaultEntry struct {
+	fh      tgutil.FileHandle
+	expires time.Time
+}
+
+// vaultCache is a bounded, mutex-guarded TTL cache of resolved vault media
+// keyed by file hash, evict-oldest on insert. All methods are nil-safe so a
+// zero-value Handler works.
+type vaultCache struct {
+	mu      sync.Mutex
+	entries map[string]vaultEntry
+	order   []string // insertion order for evict-oldest
+}
+
+func newVaultCache() *vaultCache {
+	return &vaultCache{entries: make(map[string]vaultEntry)}
+}
+
+func (c *vaultCache) get(hash string, now time.Time) (tgutil.FileHandle, bool) {
+	if c == nil {
+		return tgutil.FileHandle{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[hash]
+	if !ok {
+		return tgutil.FileHandle{}, false
+	}
+	if now.After(e.expires) {
+		c.removeLocked(hash)
+		return tgutil.FileHandle{}, false
+	}
+	return e.fh, true
+}
+
+func (c *vaultCache) put(hash string, fh tgutil.FileHandle, now time.Time) {
+	if c == nil || hash == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.entries[hash]; !exists {
+		for len(c.order) >= vaultCacheCapacity {
+			oldest := c.order[0]
+			c.order = c.order[1:]
+			delete(c.entries, oldest)
+		}
+		c.order = append(c.order, hash)
+	}
+	c.entries[hash] = vaultEntry{fh: fh, expires: now.Add(vaultCacheTTL)}
+}
+
+func (c *vaultCache) invalidate(hash string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.removeLocked(hash)
+}
+
+func (c *vaultCache) removeLocked(hash string) {
+	if _, ok := c.entries[hash]; !ok {
+		return
+	}
+	delete(c.entries, hash)
+	for i, k := range c.order {
+		if k == hash {
+			c.order = append(c.order[:i], c.order[i+1:]...)
+			break
+		}
+	}
+}
+
+// --- adaptive windowed pipeline ---
+
+// chunkSizeFor picks the transfer window size for a remaining byte count
+// (plan §4 tiers): <512KB→64KiB; <4MiB→256KiB; <32MiB→512KiB; else 1MiB.
+// Every tier is a 4KiB multiple and ≤ 1MiB, so each FetchChunk call respects
+// Telegram's offset/limit alignment and ceiling constraints by construction.
+func chunkSizeFor(remaining int64) int32 {
+	switch {
+	case remaining < 512<<10:
+		return 64 << 10
+	case remaining < 4<<20:
+		return 256 << 10
+	case remaining < 32<<20:
+		return 512 << 10
+	default:
+		return 1 << 20
+	}
+}
+
+type chunkPlanEntry struct {
+	offset int64
+	size   int32
+}
+
+// buildChunkPlan splits [start..end] into sequential windows: each window's
+// size comes from chunkSizeFor(bytes still remaining at that offset), and the
+// last window is clamped to the remainder. Window starts are 4KiB-aligned
+// relative to the file (all tier sizes are 4KiB multiples).
+func buildChunkPlan(start, end int64) []chunkPlanEntry {
+	plan := make([]chunkPlanEntry, 0, (end-start)/int64(64<<10)+2)
+	for offset := start; offset <= end; {
+		remaining := end - offset + 1
+		size := chunkSizeFor(remaining)
+		if int64(size) > remaining {
+			size = int32(remaining) // last window clamps to the remainder
+		}
+		plan = append(plan, chunkPlanEntry{offset: offset, size: size})
+		offset += int64(size)
+	}
+	return plan
+}
+
+type chunkResult struct {
+	data []byte
+	err  error
+}
+
+// pipeline fetches the planned chunks with parallel workers and delivers
+// the results strictly in order through a bounded slot window. Nothing is
+// ever fully buffered: the consumer (ServeHTTP) pulls one chunk at a time
+// and writes it straight to the flush writer.
+type pipeline struct {
+	transport   tgutil.Transport
+	lease       *pool.Lease
+	plan        []chunkPlanEntry
+	concurrency int
+	maxRetries  int
+	timeout     time.Duration
+	crossDC     bool
+
+	pool *pool.Pool
+	log  *slog.Logger
+
+	// fh is shared by all workers; RefreshFileRef swaps it in place under
+	// fhMu. FetchChunk receives value snapshots so it never races.
+	fh   tgutil.FileHandle
+	fhMu sync.Mutex
+
+	refreshes     atomic.Int32 // total RefreshFileRef attempts (budget 3)
+	lastFloodWait atomic.Int32 // seconds; from the most recent flood error
+	abortFlag     atomic.Bool
+
+	// freeSlots implements the window cap: one token per buffer slot.
+	// The dispatcher takes a token before dispatching a chunk; the
+	// consumer returns one after emitting it.
+	freeSlots chan struct{}
+
+	mu       sync.Mutex
+	cond     *sync.Cond
+	slots    []chunkResult // len = bufferCount; workers write slots[i%len]
+	filled   []bool
+	nextEmit int
+
+	jobs   chan int
+	wg     sync.WaitGroup
+	cancel context.CancelFunc
+	ctx    context.Context
+}
+
+func (h *Handler) newPipeline(ctx context.Context, lease *pool.Lease, fh tgutil.FileHandle, start, end int64) *pipeline {
+	concurrency, bufferCount, maxRetries, timeout := normalizeStreamTuning(
+		h.concurrency, h.bufferCount, h.maxRetries, h.timeout)
+	pctx, cancel := context.WithCancel(ctx)
+	p := &pipeline{
+		transport:   lease.Transport(),
+		lease:       lease,
+		plan:        buildChunkPlan(start, end),
+		concurrency: concurrency,
+		maxRetries:  maxRetries,
+		timeout:     timeout,
+		fh:          fh,
+		pool:        h.Pool,
+		log:         h.Log,
+		freeSlots:   make(chan struct{}, bufferCount),
+		slots:       make([]chunkResult, bufferCount),
+		filled:      make([]bool, bufferCount),
+		jobs:        make(chan int),
+		cancel:      cancel,
+		ctx:         pctx,
+	}
+	p.cond = sync.NewCond(&p.mu)
+	p.crossDC = fh.DC != 0 && lease.DC() != 0 && fh.DC != lease.DC()
+	for i := 0; i < bufferCount; i++ {
+		p.freeSlots <- struct{}{}
+	}
+	p.start()
+	return p
+}
+
+// start launches the dispatcher + worker pool.
+func (p *pipeline) start() {
+	workers := p.concurrency
+	if workers > len(p.plan) {
+		workers = len(p.plan)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	p.wg.Add(1)
+	go p.dispatch()
+	for i := 0; i < workers; i++ {
+		p.wg.Add(1)
+		go p.worker()
+	}
+}
+
+// dispatch feeds chunk indices to the workers, flow-controlled by the slot
+// window: a token is taken per dispatched chunk and only returned when the
+// consumer emits that chunk's result. Exiting closes the jobs channel so
+// workers drain out.
+func (p *pipeline) dispatch() {
+	defer p.wg.Done()
+	defer close(p.jobs)
+	for i := range p.plan {
+		if p.abortFlag.Load() {
+			return
+		}
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-p.freeSlots:
+		}
+		select {
+		case p.jobs <- i:
+		case <-p.ctx.Done():
+			return
+		}
+	}
+}
+
+// worker fetches its assigned chunks and publishes results into the ordered
+// slot buffer. The token discipline in dispatch guarantees the slot is free
+// when its owner writes it.
+func (p *pipeline) worker() {
+	defer p.wg.Done()
+	for idx := range p.jobs {
+		entry := p.plan[idx]
+		data, err := p.fetchWithRetry(p.ctx, entry)
+		p.mu.Lock()
+		slotIdx := idx % len(p.slots)
+		p.slots[slotIdx] = chunkResult{data: data, err: err}
+		p.filled[slotIdx] = true
+		p.cond.Broadcast()
+		p.mu.Unlock()
+	}
+}
+
+// next returns the next chunk result in plan order; ok=false once the plan
+// is exhausted. It blocks until the result arrives (fetches are bounded by
+// the per-attempt stall timeout and by the pipeline ctx).
+func (p *pipeline) next() (chunkResult, bool) {
+	p.mu.Lock()
+	for {
+		if p.nextEmit >= len(p.plan) {
+			p.mu.Unlock()
+			return chunkResult{}, false
+		}
+		slotIdx := p.nextEmit % len(p.slots)
+		if p.filled[slotIdx] {
+			res := p.slots[slotIdx]
+			p.filled[slotIdx] = false
+			p.nextEmit++
+			p.mu.Unlock()
+			// Hand the window token back; this never blocks while
+			// the dispatcher is running (outstanding ≤ bufferCount).
+			p.freeSlots <- struct{}{}
+			return res, true
+		}
+		if p.ctx.Err() != nil {
+			p.mu.Unlock()
+			return chunkResult{err: p.ctx.Err()}, true
+		}
+		p.cond.Wait()
+	}
+}
+
+// abort stops further dispatch and makes workers exit between attempts.
+// In-flight fetches are cut by the pipeline ctx (see close).
+func (p *pipeline) abort() {
+	p.abortFlag.Store(true)
+	p.mu.Lock()
+	p.cond.Broadcast()
+	p.mu.Unlock()
+}
+
+// close cancels the pipeline ctx and waits for dispatcher + workers to
+// drain. Fetches are ctx- and timeout-bounded, so the wait is short.
+func (p *pipeline) close() {
+	p.cancel()
+	p.abort()
+	p.wg.Wait()
+}
+
+// handle snapshots the shared file handle for one FetchChunk call.
+func (p *pipeline) handle() tgutil.FileHandle {
+	p.fhMu.Lock()
+	defer p.fhMu.Unlock()
+	return p.fh
+}
+
+// refreshFileRef re-resolves the file reference in place (budget: 3 per
+// request). Reports whether a retry should proceed.
+func (p *pipeline) refreshFileRef(ctx context.Context) bool {
+	if p.refreshes.Add(1) > maxRefreshesPerRequest {
+		return false
+	}
+	p.fhMu.Lock()
+	defer p.fhMu.Unlock()
+	if err := p.transport.RefreshFileRef(ctx, &p.fh); err != nil {
+		p.log.Debug("RefreshFileRef failed",
+			"refresh", p.refreshes.Load(), "error", err)
+		return false
+	}
+	return true
+}
+
+// fetchWithRetry wraps one FetchChunk with the plan §4 retry policy:
+//
+//   - per-attempt stall timeout (StreamTimeout);
+//   - permanent errors abort the pipeline immediately;
+//   - FLOOD_WAIT → pool.ReportFlood + sleep min(wait, 15s) + retry (counts
+//     against StreamMaxRetries);
+//   - ErrFileRefExpired → RefreshFileRef + immediate retry (≤3 per request);
+//   - transient errors → exponential backoff 100ms doubling, cap 15s;
+//   - ctx done or aborted → stop.
+func (p *pipeline) fetchWithRetry(ctx context.Context, entry chunkPlanEntry) ([]byte, error) {
+	var backoff time.Duration
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if p.abortFlag.Load() {
+			return nil, errors.New("stream: pipeline aborted")
+		}
+		if p.crossDC {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(crossDCPaceDelay):
+			}
+		}
+		fh := p.handle()
+		cctx, cancel := context.WithTimeout(ctx, p.timeout)
+		data, err := p.transport.FetchChunk(cctx, fh, entry.offset, entry.size)
+		cancel()
+		if err == nil {
+			return data, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if tgutil.Classify(err) == tgutil.ErrClassPermanent {
+			return nil, err
+		}
+		if attempt >= p.maxRetries {
+			return nil, err
+		}
+		if wait, isFlood := tgutil.MapFloodWait(err); isFlood {
+			p.lastFloodWait.Store(int32(wait))
+			if p.pool != nil {
+				p.pool.ReportFlood(p.transport, time.Duration(wait)*time.Second)
+			}
+			sleepFor := time.Duration(wait) * time.Second
+			if sleepFor > retryMaxBackoff {
+				sleepFor = retryMaxBackoff
+			}
+			if sleepErr := sleepCtx(ctx, sleepFor); sleepErr != nil {
+				return nil, sleepErr
+			}
+			continue
+		}
+		if errors.Is(err, tgutil.ErrFileRefExpired) {
+			if !p.refreshFileRef(ctx) {
+				return nil, err
+			}
+			continue // refreshed; retry immediately without backoff
+		}
+		// Transient: 100ms doubling, cap 15s.
+		if backoff == 0 {
+			backoff = retryBaseBackoff
+		} else {
+			backoff *= 2
+			if backoff > retryMaxBackoff {
+				backoff = retryMaxBackoff
+			}
+		}
+		if sleepErr := sleepCtx(ctx, backoff); sleepErr != nil {
+			return nil, sleepErr
+		}
+	}
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// --- headers ---
 
 // setCommonHeaders writes the common file response headers. Gateway middleware
 // owns the CORS headers.
@@ -270,78 +963,6 @@ func (h *Handler) setCommonHeaders(w http.ResponseWriter, rec *store.FileRecord,
 	hdr.Set("Cache-Control", "public, max-age=31536000")
 	hdr.Set("Connection", "keep-alive")
 	hdr.Set("X-Content-Type-Options", "nosniff")
-}
-
-// resolveVaultMedia fetches the stored message using the selected download
-// client. GetMessages has no context-aware variant; the buffered result channel
-// lets a late lookup exit and the per-client lookup semaphore bounds detached
-// calls after an HTTP timeout.
-func (h *Handler) resolveVaultMedia(ctx context.Context, c *pool.Client, rec *store.FileRecord) (telegram.MessageMedia, error) {
-	if h.Ingester == nil || rec == nil {
-		return nil, ErrVaultMessageMissing
-	}
-	type result struct {
-		msgs []telegram.NewMessage
-		err  error
-	}
-	lookupCtx, cancel := context.WithTimeout(ctx, vaultLookupTimeout)
-	defer cancel()
-	releaseLookup, ok := c.AcquireLookup(lookupCtx)
-	if !ok {
-		return nil, lookupCtx.Err()
-	}
-	ch := make(chan result, 1)
-	go func() {
-		defer releaseLookup()
-		msgs, err := c.GetMessages(h.Ingester.VaultChannelID(), &telegram.SearchOption{IDs: int(rec.VaultMsgID)})
-		ch <- result{msgs: msgs, err: err}
-	}()
-
-	select {
-	case got := <-ch:
-		if got.err != nil {
-			return nil, got.err
-		}
-		if len(got.msgs) == 0 || got.msgs[0].Message == nil {
-			return nil, ErrVaultMessageMissing
-		}
-		msg := &got.msgs[0]
-		media := msg.Media()
-		if media == nil {
-			return nil, ErrVaultMessageNoMedia
-		}
-		if rec.FileKey != "" && tgutil.FileKey(msg) != rec.FileKey {
-			return nil, ErrVaultRecordMismatch
-		}
-		// FileKey includes document size but photo keys do not. Verify the stored
-		// response length independently so Content-Length cannot describe a
-		// different vault object and leave clients stalled near completion.
-		if actualSize := tgutil.ExtractSize(msg); actualSize <= 0 || actualSize != rec.Size {
-			return nil, ErrVaultRecordMismatch
-		}
-		return media, nil
-	case <-lookupCtx.Done():
-		return nil, lookupCtx.Err()
-	}
-}
-
-func isPermanentVaultError(err error) bool {
-	if errors.Is(err, ErrVaultMessageMissing) || errors.Is(err, ErrVaultMessageNoMedia) || errors.Is(err, ErrVaultRecordMismatch) {
-		return true
-	}
-	var codeErr *gogram.ErrResponseCode
-	if errors.As(err, &codeErr) {
-		return codeErr.Message == "MESSAGE_ID_INVALID" || codeErr.Message == "MESSAGE_DELETED"
-	}
-	var rpcErr *telegram.RpcError
-	if errors.As(err, &rpcErr) {
-		return rpcErr.Message == "MESSAGE_ID_INVALID" || rpcErr.Message == "MESSAGE_DELETED"
-	}
-	return false
-}
-
-func maxNativeInt() int64 {
-	return int64(^uint(0) >> 1)
 }
 
 // --- context plumbing ---
@@ -371,12 +992,3 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 	}
 	return n, err
 }
-
-// StreamChunkSize is the Telegram transfer chunk size used by FileToLink.
-const StreamChunkSize = 1 << 20
-
-// maxConsecutiveChunkFails is one because gogram already retries each part
-// internally. Retrying that exhausted cycle at the HTTP layer is what makes a
-// browser appear stuck at 99% instead of receiving a prompt failed transfer
-// that it can reconnect/resume.
-const maxConsecutiveChunkFails = 1

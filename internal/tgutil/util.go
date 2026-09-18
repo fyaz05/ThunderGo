@@ -1,5 +1,7 @@
-// Package util provides helpers: Crockford base32, filename extraction, MIME
-// fallback, HTTP Range parsing, and Content-Disposition escaping.
+// Package util provides pure helpers: Crockford base32 tokens, HTTP Range
+// parsing, Content-Disposition escaping, byte formatting, and token hashing.
+// (The gogram-coupled message extractors were removed in Phase 3: the
+// transport seam's FileHandle/MediaInfo types carry name/mime/size/DC now.)
 package tgutil
 
 import (
@@ -10,8 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-
-	"github.com/amarnathcjd/gogram/telegram"
 )
 
 // Crockford base32 alphabet (excludes O/I/L/U to avoid visual confusion).
@@ -123,62 +123,9 @@ func NormalizeBase32(s string) string {
 	return b.String()
 }
 
-// ExtractFileName returns the original filename from a media message, or a
-// synthesized one if the media has no inherent name (e.g. photos).
-func ExtractFileName(msg *telegram.NewMessage) (string, bool) {
-	if msg == nil || msg.Message == nil {
-		return "", false
-	}
-	if !msg.IsMedia() {
-		return "", false
-	}
-
-	// Try document-style attributes first.
-	if doc := msg.Document(); doc != nil {
-		for _, attr := range doc.Attributes {
-			if fn, ok := attr.(*telegram.DocumentAttributeFilename); ok && fn.FileName != "" {
-				return fn.FileName, true
-			}
-		}
-		// Document without an explicit filename attribute — synthesize.
-		name := synthesizeFromMime(doc.MimeType, doc.ID)
-		if name != "" {
-			return name, true
-		}
-	}
-
-	// Photo: synthesize photo.jpg.
-	if msg.Photo() != nil {
-		return "photo.jpg", true
-	}
-
-	// Fall back to media-type-based synthesis.
-	mt := msg.MediaType()
-	switch mt {
-	case "video":
-		return "video.mp4", true
-	case "audio":
-		return "audio.mp3", true
-	case "voice":
-		return "voice.ogg", true
-	case "animation":
-		return "animation.mp4", true
-	case "sticker":
-		return "sticker.webp", true
-	case "document":
-		return "file.bin", true
-	}
-	return "", false
-}
-
-func synthesizeFromMime(mime string, docID int64) string {
-	ext := mimeToExt(mime)
-	if ext == "" {
-		return ""
-	}
-	return fmt.Sprintf("file_%d.%s", docID, ext)
-}
-
+// mimeToExt maps a MIME type to a canonical file extension ("" when
+// unknown). Pure helper kept from the gogram era — the ingest layer
+// synthesizes fallback names from MediaInfo now, but tests pin its behavior.
 func mimeToExt(mime string) string {
 	mime = strings.ToLower(strings.TrimSpace(mime))
 	switch mime {
@@ -222,124 +169,6 @@ func mimeToExt(mime string) string {
 		}
 	}
 	return ""
-}
-
-// ExtractMIME returns the MIME type from a media message. Falls back to
-// "application/octet-stream" if unknown.
-func ExtractMIME(msg *telegram.NewMessage) string {
-	if msg == nil || !msg.IsMedia() {
-		return "application/octet-stream"
-	}
-	if doc := msg.Document(); doc != nil && doc.MimeType != "" {
-		return doc.MimeType
-	}
-	if msg.Photo() != nil {
-		return "image/jpeg"
-	}
-	switch msg.MediaType() {
-	case "video":
-		return "video/mp4"
-	case "audio":
-		return "audio/mpeg"
-	case "voice":
-		return "audio/ogg"
-	case "animation":
-		return "video/mp4"
-	case "sticker":
-		return "image/webp"
-	}
-	return "application/octet-stream"
-}
-
-func maxPhotoSize(sizes []telegram.PhotoSize) int64 {
-	var max int64
-	for _, sz := range sizes {
-		if s, ok := sz.(*telegram.PhotoSizeObj); ok && int64(s.Size) > max {
-			max = int64(s.Size)
-		} else if s, ok := sz.(*telegram.PhotoSizeProgressive); ok {
-			if n := len(s.Sizes); n > 0 && int64(s.Sizes[n-1]) > max {
-				max = int64(s.Sizes[n-1])
-			}
-		}
-	}
-	return max
-}
-
-// ExtractSize returns the file size in bytes from a media message.
-func ExtractSize(msg *telegram.NewMessage) int64 {
-	if msg == nil || !msg.IsMedia() {
-		return 0
-	}
-	if doc := msg.Document(); doc != nil {
-		return doc.Size
-	}
-	if p := msg.Photo(); p != nil {
-		return maxPhotoSize(p.Sizes)
-	}
-	return 0
-}
-
-// ExtractDcID returns the Telegram data center ID for a media file.
-func ExtractDcID(msg *telegram.NewMessage) int32 {
-	if msg == nil || !msg.IsMedia() {
-		return 0
-	}
-	if doc := msg.Document(); doc != nil {
-		return doc.DcID
-	}
-	if p := msg.Photo(); p != nil {
-		return p.DcID
-	}
-	return 0
-}
-
-// FileKey returns the stable dedup key. Uses PackBotFileID when possible;
-// falls back to a hex encoding of (photo ID, access hash).
-//
-// PackBotFileID is undocumented in gogram — pin to the tested version.
-func FileKey(msg *telegram.NewMessage) string {
-	if msg == nil || !msg.IsMedia() {
-		return ""
-	}
-	media := msg.Media()
-	if media == nil {
-		return ""
-	}
-	if fileID := telegram.PackBotFileID(media); fileID != "" {
-		return fileID
-	}
-	// Fallback for photos / unusual media.
-	if p := msg.Photo(); p != nil {
-		return fmt.Sprintf("photo:%x:%x", p.ID, p.AccessHash)
-	}
-	return ""
-}
-
-// MediaType returns a short string for the file record: document, video,
-// audio, photo, voice, animation, sticker.
-func MediaType(msg *telegram.NewMessage) string {
-	if msg == nil {
-		return "document"
-	}
-	if msg.Photo() != nil {
-		return "photo"
-	}
-	if msg.Video() != nil {
-		return "video"
-	}
-	if msg.Audio() != nil {
-		return "audio"
-	}
-	if msg.Voice() != nil {
-		return "voice"
-	}
-	if msg.Animation() != nil {
-		return "animation"
-	}
-	if msg.Sticker() != nil {
-		return "sticker"
-	}
-	return "document"
 }
 
 // Range describes a byte window into a file. Start and End are inclusive.

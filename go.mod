@@ -4,7 +4,6 @@ module github.com/fyaz05/ThunderGo
 go 1.26.5
 
 require (
-	github.com/amarnathcjd/gogram v1.7.7
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/go-chi/chi/v5 v5.3.1
 	github.com/mtgo-labs/mtgo v0.21.0
@@ -86,5 +85,3 @@ require (
 	modernc.org/memory v1.8.0 // indirect
 	modernc.org/sqlite v1.34.5 // indirect
 )
-
-replace github.com/amarnathcjd/gogram v1.7.7 => github.com/fyaz05/gogram v1.7.8-fix.2
