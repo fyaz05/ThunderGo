@@ -288,6 +288,16 @@ func (p *Pool) PerClientInflight() []int64 {
 	return out
 }
 
+// PerClientDC returns the DC each client is attached to, indexed the same way
+// as PerClientInflight. Used by the bot's /status command.
+func (p *Pool) PerClientDC() []int {
+	out := make([]int, len(p.all))
+	for i, c := range p.all {
+		out[i] = c.GetDC()
+	}
+	return out
+}
+
 // Stop stops every client in parallel, context-aware so a stuck client.Stop()
 // cannot hang shutdown past the caller's deadline. Idempotent via sync.Once.
 func (p *Pool) Stop(ctx context.Context) {

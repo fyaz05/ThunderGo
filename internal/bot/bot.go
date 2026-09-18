@@ -1,22 +1,23 @@
 // Package bot implements command dispatch, pre-flight checks, and handler
 // routing for the Telegram bot.
 //
-// Pre-flight chain: banned → private-mode → token-activation → force-sub →
-// rate-limit. Owner bypasses every check; authorized users bypass private-mode,
-// token-activation, and rate-limit. /start always passes activation and force-sub.
+// All Telegram I/O goes through the tgutil.BotBackend seam (no transport
+// library is imported here). Pre-flight chain: banned → private-mode →
+// token-activation → force-sub → rate-limit. Owner bypasses every check;
+// authorized users bypass private-mode, token-activation, and rate-limit.
+// /start always passes activation and force-sub.
 package bot
 
 import (
 	"context"
 	crypto_rand "crypto/rand"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
-
-	"github.com/amarnathcjd/gogram/telegram"
 
 	"github.com/fyaz05/ThunderGo/internal/config"
 	"github.com/fyaz05/ThunderGo/internal/ingest"
@@ -29,6 +30,7 @@ import (
 
 type Bot struct {
 	Cfg           *config.Config
+	Backend       tgutil.BotBackend
 	Pool          *pool.Pool
 	Store         *store.Store
 	Ingester      *ingest.Ingester
@@ -37,13 +39,11 @@ type Bot struct {
 	globalLimiter *ratelimit.GlobalLimiter
 	Log           *slog.Logger
 
-	primary *telegram.Client
-
 	mu       sync.RWMutex
 	commands map[string]*Command
 
 	broadcastCancelMu sync.Mutex
-	broadcastCancels  map[int32]context.CancelFunc
+	broadcastCancels  map[int]context.CancelFunc
 
 	botUserID   int64
 	botUsername string
@@ -64,7 +64,51 @@ type Bot struct {
 
 	baseCtx       context.Context
 	baseCtxCancel context.CancelFunc
+
+	// db is the test seam for the store: nil in production (b.st() then
+	// returns b.Store). Tests install a MongoDB-free fake here.
+	db botStore
 }
+
+// botStore narrows *store.Store to the methods the bot layer uses. Production
+// always passes the real *store.Store; the interface exists only so tests can
+// exercise the gate chain without MongoDB.
+type botStore interface {
+	IsUserBanned(ctx context.Context, userID int64) (bool, error)
+	IsChannelBanned(ctx context.Context, channelID int64) (bool, error)
+	IsAuthorized(ctx context.Context, userID int64) (bool, error)
+	IsUserActivated(ctx context.Context, userID int64) (bool, error)
+	UpsertUser(ctx context.Context, u store.User) (bool, error)
+	SaveActivationToken(ctx context.Context, token string, ttl time.Duration) error
+	ConsumeActivationToken(ctx context.Context, token string) error
+	ActivateUser(ctx context.Context, userID int64, ttl time.Duration) error
+	HasUser(ctx context.Context, userID int64) (bool, error)
+	StreamUsers(ctx context.Context, fn func(u store.User) error) error
+	DeleteUser(ctx context.Context, userID int64) error
+	CountUsers(ctx context.Context) (int64, error)
+	BanUser(ctx context.Context, b store.BannedUser) error
+	BanChannel(ctx context.Context, b store.BannedChannel) error
+	UnbanUser(ctx context.Context, userID int64) error
+	UnbanChannel(ctx context.Context, channelID int64) error
+	Authorize(ctx context.Context, a store.AuthorizedUser) error
+	Deauthorize(ctx context.Context, userID int64) error
+	ListAuthorized(ctx context.Context) ([]store.AuthorizedUser, error)
+	InvalidateActivatedUser(ctx context.Context, userID int64) error
+	SaveRestartMarker(ctx context.Context, m store.RestartMarker) error
+	PopRestartMarker(ctx context.Context) (*store.RestartMarker, error)
+}
+
+// st returns the store facade: the test seam when installed, else the real
+// store. Compile-time checks keep the two aligned.
+func (b *Bot) st() botStore {
+	if b.db != nil {
+		return b.db
+	}
+	return b.Store
+}
+
+// Compile-time gate: the real store satisfies the narrowed interface.
+var _ botStore = (*store.Store)(nil)
 
 // OwnerOnly commands are silently ignored when invoked by a non-owner.
 type Command struct {
@@ -74,33 +118,71 @@ type Command struct {
 	Handler     func(c *Context) error
 }
 
+// Sent is a backend-agnostic handle to a message the bot just sent. It
+// carries just enough identity to edit the message later (status messages).
+type Sent struct {
+	ChatID int64
+	ID     int
+}
+
 type Context struct {
 	Bot          *Bot
 	Cmd          *Command
-	Msg          *telegram.NewMessage
+	Msg          tgutil.IncomingMsg
+	Ctx          context.Context // per-dispatch context for backend calls
 	Args         string
 	IsOwner      bool
 	IsAuthorized bool
 }
 
-// Reply wraps m.Reply with HTML parse mode. Callers must escape user-controlled text.
-func (c *Context) Reply(text string) (*telegram.NewMessage, error) {
-	return c.Msg.Reply(text, &telegram.SendOptions{ParseMode: "HTML"})
+// Reply sends an HTML message quoting the user's message. Callers must escape
+// user-controlled text. Returns a Sent handle usable for later edits.
+func (c *Context) Reply(text string) (Sent, error) {
+	id, err := c.Bot.Backend.SendHTMLMsg(c.Ctx, c.Msg.ChatID, text, nil, c.Msg.MsgID)
+	if err != nil {
+		return Sent{}, err
+	}
+	return Sent{ChatID: c.Msg.ChatID, ID: id}, nil
 }
 
-func (c *Context) ReplyFormatted(text string) (*telegram.NewMessage, error) {
+// ReplyFormatted is Reply with HTML parse mode (kept for parity with the
+// original handler vocabulary).
+func (c *Context) ReplyFormatted(text string) (Sent, error) {
 	return c.Reply(text)
 }
 
-// Respond is like Reply but doesn't quote the original message.
-func (c *Context) Respond(text string) (*telegram.NewMessage, error) {
-	return c.Msg.Respond(text, &telegram.SendOptions{ParseMode: "HTML"})
+// ReplyMarkup is Reply with an inline keyboard attached.
+func (c *Context) ReplyMarkup(text string, markup any) (Sent, error) {
+	id, err := c.Bot.Backend.SendHTMLMsg(c.Ctx, c.Msg.ChatID, text, markup, c.Msg.MsgID)
+	if err != nil {
+		return Sent{}, err
+	}
+	return Sent{ChatID: c.Msg.ChatID, ID: id}, nil
 }
 
-// The caller must invoke Start to connect.
-func New(cfg *config.Config, p *pool.Pool, s *store.Store, in *ingest.Ingester, sh *shortener.Shortener, lim *ratelimit.Limiter, log *slog.Logger) *Bot {
+// Respond is like Reply but doesn't quote the original message.
+func (c *Context) Respond(text string) (Sent, error) {
+	id, err := c.Bot.Backend.SendHTMLMsg(c.Ctx, c.Msg.ChatID, text, nil, 0)
+	if err != nil {
+		return Sent{}, err
+	}
+	return Sent{ChatID: c.Msg.ChatID, ID: id}, nil
+}
+
+// RespondMarkup is Respond with an inline keyboard attached.
+func (c *Context) RespondMarkup(text string, markup any) (Sent, error) {
+	id, err := c.Bot.Backend.SendHTMLMsg(c.Ctx, c.Msg.ChatID, text, markup, 0)
+	if err != nil {
+		return Sent{}, err
+	}
+	return Sent{ChatID: c.Msg.ChatID, ID: id}, nil
+}
+
+// The caller must invoke Start to connect the backend.
+func New(cfg *config.Config, backend tgutil.BotBackend, p *pool.Pool, s *store.Store, in *ingest.Ingester, sh *shortener.Shortener, lim *ratelimit.Limiter, log *slog.Logger) *Bot {
 	b := &Bot{
 		Cfg:       cfg,
+		Backend:   backend,
 		Pool:      p,
 		Store:     s,
 		Ingester:  in,
@@ -110,7 +192,7 @@ func New(cfg *config.Config, p *pool.Pool, s *store.Store, in *ingest.Ingester, 
 		globalLimiter:    ratelimit.NewGlobal(cfg.GlobalRPS, 0), // burst=0 → defaults to 2x RPS inside
 		Log:              log,
 		commands:         make(map[string]*Command),
-		broadcastCancels: make(map[int32]context.CancelFunc),
+		broadcastCancels: make(map[int]context.CancelFunc),
 		startTime:        time.Now(),
 		sem:              make(chan struct{}, 128),
 		stopCh:           make(chan struct{}),
@@ -131,14 +213,11 @@ func (b *Bot) Register(cmd *Command) {
 
 // GetMe failure is fatal: admin detection and DM features depend on it.
 func (b *Bot) Start(ctx context.Context) error {
-	primary := b.Pool.Primary()
-	if primary == nil {
-		return fmt.Errorf("no primary client available")
+	if b.Backend == nil {
+		return errors.New("no bot backend available")
 	}
-	b.primary = primary.Client
-
-	me, err := b.primary.GetMe()
-	if err != nil || me == nil {
+	me, err := b.Backend.Me(ctx)
+	if err != nil || me.ID == 0 {
 		return fmt.Errorf("GetMe failed (admin detection and DM features require it): %w", err)
 	}
 	b.botUserID = me.ID
@@ -146,7 +225,7 @@ func (b *Bot) Start(ctx context.Context) error {
 
 	// Cache force-sub channel info (best-effort — non-fatal on failure).
 	if b.Cfg.ForceSubChannelID != 0 {
-		if ch, err := b.primary.GetChannel(b.Cfg.ForceSubChannelID); err == nil && ch != nil {
+		if ch, chErr := b.Backend.ResolveChat(ctx, fmt.Sprintf("%d", b.Cfg.ForceSubChannelID)); chErr == nil {
 			b.forceSubTitle = ch.Title
 			if ch.Username != "" {
 				b.forceSubLink = "https://t.me/" + ch.Username
@@ -161,15 +240,21 @@ func (b *Bot) Start(ctx context.Context) error {
 	}
 
 	b.registerBuiltinCommands()
-	b.primary.On(telegram.OnMessage, b.dispatch)
-	b.primary.OnCallback("broadcast_cancel", b.handleBroadcastCancel)
+	// ONE catch-all message hook: the dispatcher owns command parsing, the
+	// unknown-command silence, OwnerOnly denial, preflight and routing —
+	// exactly like the previous transport-level message handler.
+	b.Backend.OnAnyMessage(b.dispatch)
+	b.Backend.OnCallback("broadcast_cancel", b.handleBroadcastCancel)
 	// Inline-button navigation callbacks: help/about re-send their messages;
 	// close deletes the host message. restart_broadcast is intentionally not
 	// wired (a button press can't supply a replied-to message).
-	b.primary.OnCallback("help", b.handleHelpCallback)
-	b.primary.OnCallback("about", b.handleAboutCallback)
-	b.primary.OnCallback("close", b.handleCloseCallback)
-	b.primary.OnCallback(string(telegram.OnCallbackQuery), b.handleUnsupportedCallback)
+	b.Backend.OnCallback("help", b.handleHelpCallback)
+	b.Backend.OnCallback("about", b.handleAboutCallback)
+	b.Backend.OnCallback("close", b.handleCloseCallback)
+	// Catch-all must be registered LAST: the backend matches callbacks by
+	// longest prefix, so the specific routes above win over the empty
+	// prefix below.
+	b.Backend.OnCallback("", b.handleUnsupportedCallback)
 
 	if err := b.registerCommandList(ctx); err != nil {
 		b.Log.Warn("failed to register bot commands with Telegram", "error", err)
@@ -187,25 +272,22 @@ func (b *Bot) Start(ctx context.Context) error {
 	return nil
 }
 
-func (b *Bot) registerBroadcastCancel(msgID int32, cancel context.CancelFunc) {
+func (b *Bot) registerBroadcastCancel(msgID int, cancel context.CancelFunc) {
 	b.broadcastCancelMu.Lock()
 	defer b.broadcastCancelMu.Unlock()
 	b.broadcastCancels[msgID] = cancel
 }
 
-func (b *Bot) unregisterBroadcastCancel(msgID int32) {
+func (b *Bot) unregisterBroadcastCancel(msgID int) {
 	b.broadcastCancelMu.Lock()
 	defer b.broadcastCancelMu.Unlock()
 	delete(b.broadcastCancels, msgID)
 }
 
 // Owner-only.
-func (b *Bot) handleBroadcastCancel(cq *telegram.CallbackQuery) error {
-	if cq == nil {
-		return nil
-	}
+func (b *Bot) handleBroadcastCancel(ctx context.Context, cq tgutil.CallbackQuery) error {
 	if !b.Cfg.IsOwner(cq.SenderID) {
-		_, _ = cq.Answer(msgCallbackBroadcastCancelDenied, &telegram.CallbackOptions{Alert: true})
+		_ = b.Backend.AnswerCallback(ctx, cq, msgCallbackBroadcastCancelDenied, true, "")
 		return nil
 	}
 	msgID := cq.MessageID
@@ -213,11 +295,11 @@ func (b *Bot) handleBroadcastCancel(cq *telegram.CallbackQuery) error {
 	cancel, ok := b.broadcastCancels[msgID]
 	b.broadcastCancelMu.Unlock()
 	if !ok {
-		_, _ = cq.Answer(msgCallbackBroadcastNotFound, &telegram.CallbackOptions{Alert: true})
+		_ = b.Backend.AnswerCallback(ctx, cq, msgCallbackBroadcastNotFound, true, "")
 		return nil
 	}
 	cancel()
-	_, _ = cq.Answer(msgCallbackBroadcastCancelled)
+	_ = b.Backend.AnswerCallback(ctx, cq, msgCallbackBroadcastCancelled, false, "")
 	return nil
 }
 
@@ -232,7 +314,7 @@ func (b *Bot) Stop() {
 func (b *Bot) registerCommandList(ctx context.Context) error {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	cmds := make([]*telegram.BotCommand, 0, len(b.commands))
+	cmds := make([]tgutil.BotCommand, 0, len(b.commands))
 	for _, c := range b.commands {
 		if c.OwnerOnly {
 			continue
@@ -241,18 +323,16 @@ func (b *Bot) registerCommandList(ctx context.Context) error {
 		if utf8.RuneCountInString(desc) > 256 {
 			desc = string([]rune(desc)[:256])
 		}
-		cmds = append(cmds, &telegram.BotCommand{Command: c.Name, Description: desc})
+		cmds = append(cmds, tgutil.BotCommand{Command: c.Name, Description: desc})
 	}
 	if len(cmds) == 0 {
 		return nil
 	}
-	var scope telegram.BotCommandScope = &telegram.BotCommandScopeDefault{}
-	_, err := b.primary.SetBotCommands(cmds, &scope, "en")
-	return err
+	return b.Backend.SetCommands(ctx, cmds)
 }
 
 // After Stop(), new messages are silently dropped.
-func (b *Bot) dispatch(m *telegram.NewMessage) error {
+func (b *Bot) dispatch(ctx context.Context, m tgutil.IncomingMsg) error {
 	// Add to WaitGroup BEFORE the stopCh check so Stop()'s Wait() can't return
 	// before this goroutine is launched.
 	b.handlerWg.Add(1)
@@ -272,27 +352,32 @@ func (b *Bot) dispatch(m *telegram.NewMessage) error {
 	go func() {
 		defer b.handlerWg.Done()
 		defer func() { <-b.sem }()
-		b.dispatchAsync(m)
+		// Per-dispatch context: derived from baseCtx (cancelled on Stop)
+		// and cancelled when the dispatch returns. The transport-supplied
+		// ctx is deliberately ignored — it may be tied to update
+		// processing that ends as soon as this hook returns, while the
+		// async handler (e.g. a broadcast) runs far beyond that.
+		dispatchCtx, cancel := context.WithCancel(b.baseCtx)
+		defer cancel()
+		b.dispatchAsync(dispatchCtx, m)
 	}()
 	return nil
 }
 
-func (b *Bot) dispatchAsync(m *telegram.NewMessage) {
+func (b *Bot) dispatchAsync(ctx context.Context, m tgutil.IncomingMsg) {
 	defer func() {
 		if r := recover(); r != nil {
 			b.Log.Error("panic in bot handler", "recover", r, "stack", string(debugStack()))
 		}
 	}()
 
-	// IsChannel() covers broadcast channels; IsGroup() covers supergroups.
-	if m.IsChannel() || m.IsGroup() {
-		channelID := m.ChannelID()
-		if channelID == 0 {
-			channelID = m.ChatID()
-		}
+	// IsChannel covers broadcast channels; IsGroup covers supergroups.
+	if m.IsChannel || m.IsGroup {
+		// IncomingMsg.ChatID is already the marked (-100-prefixed) chat ID.
+		channelID := m.ChatID
 		if channelID != 0 {
 			banCtx, banCancel := context.WithTimeout(b.baseCtx, 10*time.Second)
-			banned, banErr := b.Store.IsChannelBanned(banCtx, channelID)
+			banned, banErr := b.st().IsChannelBanned(banCtx, channelID)
 			banCancel()
 			if banErr != nil {
 				b.Log.Warn("chat banned check DB error; denying message", "chat_id", channelID, "error", banErr)
@@ -300,30 +385,32 @@ func (b *Bot) dispatchAsync(m *telegram.NewMessage) {
 			}
 			if banned {
 				b.Log.Info("rejecting message from banned chat", "chat_id", channelID)
-				_ = m.Client.LeaveChannel(channelID)
+				_ = b.Backend.LeaveChat(b.baseCtx, channelID)
 				return
 			}
 		}
 		for _, bannedID := range b.Cfg.BannedChannelIDs {
 			if bannedID == channelID {
 				b.Log.Info("rejecting message from config-banned channel", "channel_id", channelID)
-				_ = m.Client.LeaveChannel(channelID)
+				_ = b.Backend.LeaveChat(b.baseCtx, channelID)
 				return
 			}
 		}
 	}
 
-	senderID := m.SenderID()
+	senderID := m.SenderID
 	isOwner := b.Cfg.IsOwner(senderID)
 	authCtx, authCancel := context.WithTimeout(b.baseCtx, 10*time.Second)
-	isAuthorized, authErr := b.Store.IsAuthorized(authCtx, senderID)
+	isAuthorized, authErr := b.st().IsAuthorized(authCtx, senderID)
 	authCancel()
 	if authErr != nil {
 		b.Log.Warn("authorized check DB error; treating as unauthorized", "user_id", senderID, "error", authErr)
 	}
 
-	if m.IsCommand() {
-		cmdName := strings.TrimPrefix(m.GetCommand(), "/")
+	if m.IsCommand {
+		// The transport strips the "/cmd@bot" suffix into CommandName;
+		// re-apply the same normalization defensively.
+		cmdName := strings.TrimPrefix(m.CommandName, "/")
 		if i := strings.IndexByte(cmdName, '@'); i > 0 {
 			cmdName = cmdName[:i]
 		}
@@ -338,17 +425,18 @@ func (b *Bot) dispatchAsync(m *telegram.NewMessage) {
 			return
 		}
 
-		ctx := &Context{
-			Bot:          b,
-			Cmd:          cmd,
-			Msg:          m,
-			Args:         strings.TrimSpace(m.Args()),
-			IsOwner:      isOwner,
-			IsAuthorized: isAuthorized,
-		}
-
 		if !isOwner {
-			if stop, err := b.preflight(ctx); stop {
+			c := &Context{
+				Bot:          b,
+				Cmd:          cmd,
+				Msg:          m,
+				Ctx:          ctx,
+				Args:         strings.TrimSpace(m.Args),
+				IsOwner:      isOwner,
+				IsAuthorized: isAuthorized,
+			}
+
+			if stop, err := b.preflight(c); stop {
 				if err != nil {
 					b.Log.Debug("preflight rejected command", "cmd", cmdName, "reason", err.Error(), "user_id", senderID)
 				}
@@ -356,31 +444,41 @@ func (b *Bot) dispatchAsync(m *telegram.NewMessage) {
 			}
 		}
 
-		if err := cmd.Handler(ctx); err != nil {
+		c := &Context{
+			Bot:          b,
+			Cmd:          cmd,
+			Msg:          m,
+			Ctx:          ctx,
+			Args:         strings.TrimSpace(m.Args),
+			IsOwner:      isOwner,
+			IsAuthorized: isAuthorized,
+		}
+		if err := cmd.Handler(c); err != nil {
 			b.Log.Error("command handler error", "cmd", cmdName, "error", err)
-			_, _ = ctx.Reply("⚠️ An error occurred. Please try again.")
+			_, _ = c.Reply("⚠️ An error occurred. Please try again.")
 		}
 		return
 	}
 
 	// Non-command media in private chat: treat as file-ingest request.
-	if m.IsPrivate() && m.IsMedia() {
+	if m.IsPrivate && m.Media != nil {
 		if !isOwner {
-			ctx := &Context{Bot: b, Msg: m, IsOwner: isOwner, IsAuthorized: isAuthorized}
-			if stop, err := b.preflight(ctx); stop {
+			cmdCtx := &Context{Bot: b, Msg: m, Ctx: ctx, IsOwner: isOwner, IsAuthorized: isAuthorized}
+			if stop, err := b.preflight(cmdCtx); stop {
 				if err != nil {
 					b.Log.Debug("preflight rejected private media", "reason", err.Error(), "user_id", senderID)
 				}
 				return
 			}
 		}
-		b.handlePrivateMedia(m, isOwner, isAuthorized)
+		b.handlePrivateMedia(ctx, m, isOwner, isAuthorized)
 		return
 	}
 
-	// m.IsChannel() is true only for broadcast channels (not supergroups); IsChannelPost() only matches forwarded posts.
-	if m.IsChannel() && b.Cfg.ChannelAutoProcess && m.IsMedia() {
-		b.handleChannelAutoProcess(m)
+	// m.IsChannel is true only for broadcast channels (not supergroups);
+	// channel posts that were forwarded to the bot are handled the same way.
+	if m.IsChannel && b.Cfg.ChannelAutoProcess && m.Media != nil {
+		b.handleChannelAutoProcess(ctx, m)
 		return
 	}
 }
@@ -391,23 +489,23 @@ func (b *Bot) dispatchAsync(m *telegram.NewMessage) {
 func (b *Bot) preflight(c *Context) (bool, error) {
 	ctx, cancel := context.WithTimeout(b.baseCtx, 30*time.Second)
 	defer cancel()
-	senderID := c.Msg.SenderID()
+	senderID := c.Msg.SenderID
 
 	// Banned check (no bypass). Fail closed on DB error.
-	banned, banErr := b.Store.IsUserBanned(ctx, senderID)
+	banned, banErr := b.st().IsUserBanned(ctx, senderID)
 	if banErr != nil {
 		b.Log.Warn("banned check DB error; denying access", "user_id", senderID, "error", banErr)
-		_, _ = c.Msg.Respond(msgTempDBError)
+		_, _ = c.Respond(msgTempDBError)
 		return true, fmt.Errorf("banned check DB error")
 	}
 	if banned {
-		_, _ = c.Msg.Respond(msgBannedNotice)
+		_, _ = c.Respond(msgBannedNotice)
 		return true, fmt.Errorf("banned user")
 	}
 
 	// Private-mode check (owner + authorized bypass).
 	if b.Cfg.PrivateMode && !c.IsAuthorized {
-		_, _ = c.Msg.Respond(msgPrivateMode)
+		_, _ = c.Respond(msgPrivateMode)
 		return true, fmt.Errorf("private mode")
 	}
 
@@ -415,10 +513,10 @@ func (b *Bot) preflight(c *Context) (bool, error) {
 
 	// Token activation check (owner + authorized bypass). Fail closed on DB error.
 	if b.Cfg.TokenEnabled && !c.IsAuthorized && !isStart {
-		activated, actErr := b.Store.IsUserActivated(ctx, senderID)
+		activated, actErr := b.st().IsUserActivated(ctx, senderID)
 		if actErr != nil {
 			b.Log.Warn("activation check DB error; denying access", "user_id", senderID, "error", actErr)
-			_, _ = c.Msg.Respond(msgTempDBError)
+			_, _ = c.Respond(msgTempDBError)
 			return true, fmt.Errorf("activation check DB error")
 		}
 		if !activated {
@@ -430,24 +528,20 @@ func (b *Bot) preflight(c *Context) (bool, error) {
 	// Force-subscription check. Only member/admin/creator pass; left/kicked/
 	// restricted are rejected (restricted may lack read perms).
 	if !isStart && b.Cfg.ForceSubChannelID != 0 {
-		primary := b.Pool.Primary()
-		if primary == nil {
-			b.Log.Warn("preflight: no primary client for force-sub check")
-			_, _ = c.Msg.Respond(msgTempDBError)
-			return true, fmt.Errorf("no primary client")
+		status, err := b.Backend.GetChatMemberStatus(ctx, b.Cfg.ForceSubChannelID, senderID)
+		if err != nil {
+			b.Log.Debug("force-sub check error", "error", err)
 		}
-		member, err := primary.GetChatMember(b.Cfg.ForceSubChannelID, senderID)
-		if err != nil || member == nil ||
-			(member.Status != "member" && member.Status != "admin" && member.Status != "creator") {
-			if err != nil && !telegram.MatchError(err, "USER_NOT_PARTICIPANT") {
-				b.Log.Debug("force-sub check error", "error", err)
-			}
+		// USER_NOT_PARTICIPANT (and other lookup failures) arrive as
+		// err != nil or a non-member status — both reject with the
+		// join prompt, exactly like the previous transport's behavior.
+		if err != nil || (status != "member" && status != "administrator" && status != "creator") {
 			joinURL := b.forceSubLink
-			opts := &telegram.SendOptions{ParseMode: "HTML"}
+			var markup any
 			if joinURL != "" {
-				opts.ReplyMarkup = telegram.InlineURL(msgForceSubButton, joinURL)
+				markup = tgutil.NewKeyboard().AddRow(tgutil.InlineURL(msgForceSubButton, joinURL)).Build()
 			}
-			_, _ = c.Msg.Respond(fmt.Sprintf(msgForceSub, b.forceSubTitle), opts)
+			_ = b.Backend.SendHTML(ctx, c.Msg.ChatID, fmt.Sprintf(msgForceSub, b.forceSubTitle), markup, 0)
 			return true, fmt.Errorf("force-sub")
 		}
 	}
@@ -462,7 +556,7 @@ func (b *Bot) preflight(c *Context) (bool, error) {
 			if secs < 1 {
 				secs = 1
 			}
-			_, _ = c.Msg.Respond(fmt.Sprintf(msgRateLimited, secs, b.Cfg.RateLimit))
+			_, _ = c.Respond(fmt.Sprintf(msgRateLimited, secs, b.Cfg.RateLimit))
 			return true, fmt.Errorf("rate limited")
 		}
 	}
@@ -473,7 +567,7 @@ func (b *Bot) preflight(c *Context) (bool, error) {
 		if !b.globalLimiter.Allow() {
 			delay := b.globalLimiter.RetryAfter()
 			secs := int(delay.Seconds()) + 1
-			_, _ = c.Msg.Respond(fmt.Sprintf(msgGlobalRateLimited, secs))
+			_, _ = c.Respond(fmt.Sprintf(msgGlobalRateLimited, secs))
 			return true, fmt.Errorf("global rate limited")
 		}
 	}
@@ -486,15 +580,15 @@ func (b *Bot) promptActivation(c *Context) {
 	token, err := generateActivationToken()
 	if err != nil {
 		b.Log.Error("generating activation token", "error", err)
-		_, _ = c.Msg.Respond(msgErrInternal)
+		_, _ = c.Respond(msgErrInternal)
 		return
 	}
 
 	actCtx, actCancel := context.WithTimeout(b.baseCtx, 10*time.Second)
 	defer actCancel()
-	if err := b.Store.SaveActivationToken(actCtx, token, 10*time.Minute); err != nil {
+	if err := b.st().SaveActivationToken(actCtx, token, 10*time.Minute); err != nil {
 		b.Log.Warn("saving activation token", "error", err)
-		_, _ = c.Msg.Respond(msgErrInternal)
+		_, _ = c.Respond(msgErrInternal)
 		return
 	}
 
@@ -510,9 +604,8 @@ func (b *Bot) promptActivation(c *Context) {
 		}
 	}
 
-	opts := &telegram.SendOptions{ParseMode: "HTML"}
-	opts.ReplyMarkup = telegram.InlineURL(msgActivationButton, activateURL)
-	_, _ = c.Msg.Respond(msgActivationRequired, opts)
+	markup := tgutil.NewKeyboard().AddRow(tgutil.InlineURL(msgActivationButton, activateURL)).Build()
+	_, _ = c.RespondMarkup(msgActivationRequired, markup)
 }
 
 func generateActivationToken() (string, error) {
@@ -521,4 +614,27 @@ func generateActivationToken() (string, error) {
 		return "", fmt.Errorf("crypto/rand.Read failed: %w", err)
 	}
 	return tgutil.EncodeBase32(buf), nil
+}
+
+// broadcastUnreachable reports whether err is a permanent per-user delivery
+// failure: the target blocked the bot, was deactivated, cannot be addressed
+// (PEER_ID_INVALID) or the chat forbids writes. Such users are pruned after a
+// broadcast instead of retried.
+//
+// PEER_ID_INVALID is mapped to ErrStaleMedia by the transport's error mapping
+// (it is a permanent-class RPC) with the symbolic type preserved in the error
+// text; the other three surface as *tgutil.RPCError.
+func broadcastUnreachable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var rpc *tgutil.RPCError
+	if errors.As(err, &rpc) {
+		switch rpc.Type {
+		case "USER_IS_BLOCKED", "PEER_ID_INVALID", "USER_DEACTIVATED", "CHAT_WRITE_FORBIDDEN":
+			return true
+		}
+		return false
+	}
+	return errors.Is(err, tgutil.ErrStaleMedia) && strings.Contains(err.Error(), "PEER_ID_INVALID")
 }

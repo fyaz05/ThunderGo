@@ -44,6 +44,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -92,6 +93,7 @@ type IncomingMsg struct {
 	CommandName  string // without slash/bot-suffix, e.g. "start"
 	Args         string // text after the command word, trimmed
 	ReplyToMsgID int
+	ChatTitle    string     // chat display title, "" when unknown or private
 	Media        *MediaInfo // nil if none
 	Raw          any        // escape hatch (*types.Message); only tgutil may type-assert
 }
@@ -143,6 +145,16 @@ type BotCommand struct {
 	Description string
 }
 
+// ChatInfo is the backend-agnostic view of a chat/channel identity. It backs
+// the force-subscription flow: the bot resolves its configured channel into a
+// title and a public join link at startup.
+type ChatInfo struct {
+	ID       int64 // Bot-API marked ID (channels/supergroups -100-prefixed)
+	Title    string
+	Username string
+	Raw      any // opaque backend chat object; only tgutil may type-assert
+}
+
 // ---------------------------------------------------------------------------
 // Interfaces
 // ---------------------------------------------------------------------------
@@ -176,6 +188,9 @@ type BotBackend interface {
 	Me(ctx context.Context) (BotInfo, error)                       // id, username, DC
 	SetCommands(ctx context.Context, cmds []BotCommand) error
 	SendHTML(ctx context.Context, chatID int64, html string, markup any, replyTo int) error
+	// SendHTMLMsg is SendHTML that also returns the new message's ID, for
+	// status messages the bot edits in place afterwards.
+	SendHTMLMsg(ctx context.Context, chatID int64, html string, markup any, replyTo int) (int, error)
 	EditHTML(ctx context.Context, chatID int64, msgID int, html string, markup any) error
 	DeleteMessages(ctx context.Context, chatID int64, msgIDs ...int) error
 	// ForwardMessages copies (with hidden author when hideAuthor is set) the
@@ -188,6 +203,10 @@ type BotBackend interface {
 	SendChatAction(ctx context.Context, chatID int64, action string) error
 	GetUser(ctx context.Context, userID int64) (UserInfo, error) // id, names, username, photo DC
 	ResolveUsername(ctx context.Context, username string) (UserInfo, error)
+	// ResolveChat resolves a chat reference — a numeric Bot-API marked chat
+	// ID (decimal string, e.g. "-1001234567890") or a @username — to the
+	// chat's identity (title + username).
+	ResolveChat(ctx context.Context, ref string) (ChatInfo, error)
 	// GetChatMemberStatus returns "creator", "administrator", "member",
 	// "restricted", "left" or "kicked". Non-members map to "left".
 	GetChatMemberStatus(ctx context.Context, chatID, userID int64) (string, error)
@@ -1001,6 +1020,27 @@ func (t *MTGOTransport) SendHTML(ctx context.Context, chatID int64, html string,
 	return nil
 }
 
+// SendHTMLMsg sends an HTML-formatted message, optionally as a reply, and
+// returns the new message's ID (0 on failure).
+func (t *MTGOTransport) SendHTMLMsg(ctx context.Context, chatID int64, html string, markup any, replyTo int) (int, error) {
+	mk, err := buildMarkup(markup)
+	if err != nil {
+		return 0, err
+	}
+	opt := &params.SendMessage{ParseMode: params.HTML, ReplyMarkup: mk}
+	if replyTo > 0 {
+		opt.ReplyToMessageID = int32(replyTo) //nosec G115 // message IDs fit int32
+	}
+	msg, err := t.client.SendMessage(ctx, chatID, html, opt)
+	if err != nil {
+		return 0, t.mapErr(err, "send html")
+	}
+	if msg == nil {
+		return 0, nil
+	}
+	return int(msg.ID), nil
+}
+
 // EditHTML edits an existing message's text with HTML formatting. An empty
 // Markup clears the keyboard; nil leaves it untouched.
 func (t *MTGOTransport) EditHTML(ctx context.Context, chatID int64, msgID int, html string, markup any) error {
@@ -1194,6 +1234,94 @@ func (t *MTGOTransport) ResolveUsername(ctx context.Context, username string) (U
 	}
 }
 
+// ResolveChat resolves a chat reference to the chat's identity. refs are
+// either a numeric Bot-API marked chat ID (decimal string) or a @username.
+//
+// Numeric channels/supergroups are fetched via channels.getChannels with a
+// zero access hash (the same RPC shape mtgo's own bot access-hash repair
+// uses, and the direct equivalent of gogram's GetChannel). Usernames go
+// through contacts.resolveUsername followed by channels.getChannels so the
+// full channel object (title + username) is returned.
+func (t *MTGOTransport) ResolveChat(ctx context.Context, ref string) (ChatInfo, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return ChatInfo{}, errors.New("tgutil: empty chat reference")
+	}
+	if id, err := strconv.ParseInt(strings.TrimPrefix(ref, "@"), 10, 64); err == nil {
+		bare, ok := bareChannelID(id)
+		if !ok {
+			return ChatInfo{}, fmt.Errorf("tgutil: resolve chat: unsupported chat id %d", id)
+		}
+		ch, err := t.fetchChannel(ctx, &tg.InputChannel{ChannelID: bare, AccessHash: 0})
+		if err != nil {
+			return ChatInfo{}, t.mapErr(err, "resolve chat")
+		}
+		return ChatInfo{ID: id, Title: ch.Title, Username: ch.Username, Raw: ch}, nil
+	}
+	username := strings.TrimPrefix(ref, "@")
+	peer, err := t.client.ResolveUsername(ctx, username)
+	if err != nil {
+		return ChatInfo{}, t.mapErr(err, "resolve chat")
+	}
+	p, ok := peer.(*tg.InputPeerChannel)
+	if !ok {
+		return ChatInfo{}, fmt.Errorf("tgutil: chat reference %q resolved to unsupported peer %T", ref, peer)
+	}
+	ch, err := t.fetchChannel(ctx, &tg.InputChannel{ChannelID: p.ChannelID, AccessHash: p.AccessHash})
+	if err != nil {
+		return ChatInfo{}, t.mapErr(err, "resolve chat")
+	}
+	return ChatInfo{ID: markedChannelID(ch.ID), Title: ch.Title, Username: ch.Username, Raw: ch}, nil
+}
+
+// fetchChannel issues channels.getChannels for one input channel and returns
+// the matching *tg.Channel. The response may also carry *tg.ChannelForbidden
+// entries (deactivated/deleted chats) — those do not match and yield an error.
+func (t *MTGOTransport) fetchChannel(ctx context.Context, in tg.InputChannelClass) (*tg.Channel, error) {
+	result, err := t.client.Raw().ChannelsGetChannels(ctx, &tg.ChannelsGetChannelsRequest{
+		ID: []tg.InputChannelClass{in},
+	})
+	if err != nil {
+		return nil, err
+	}
+	var chats []tg.ChatClass
+	switch v := result.(type) {
+	case *tg.MessagesChats:
+		chats = v.Chats
+	case *tg.MessagesChatsSlice:
+		chats = v.Chats
+	}
+	for _, cc := range chats {
+		if ch, ok := cc.(*tg.Channel); ok && ch.ID == channelIDOf(in) {
+			return ch, nil
+		}
+	}
+	return nil, fmt.Errorf("tgutil: channel %T not found (or forbidden)", in)
+}
+
+// channelIDOf reads the numeric channel ID out of an InputChannelClass.
+func channelIDOf(in tg.InputChannelClass) int64 {
+	switch c := in.(type) {
+	case *tg.InputChannel:
+		return c.ChannelID
+	case *tg.InputChannelEmpty:
+		return 0
+	default:
+		return 0
+	}
+}
+
+// bareChannelID converts a Bot-API marked channel/supergroup ID (-100 basis)
+// to the bare MTProto channel ID. Returns ok=false for IDs outside the
+// -100-prefixed range (users, basic groups).
+func bareChannelID(marked int64) (int64, bool) {
+	bare := markedChannelBasis - marked
+	if bare <= 0 {
+		return 0, false
+	}
+	return bare, true
+}
+
 // GetChatMemberStatus returns the Bot-API-style membership status. Non-member
 // errors (USER_NOT_PARTICIPANT) map to "left"; mtgo's "owner" maps to
 // "creator" and "banned" to "kicked".
@@ -1329,6 +1457,7 @@ func convertMessage(msg *types.Message) IncomingMsg {
 		MsgID:        int(msg.ID),
 		Text:         msg.Text,
 		ReplyToMsgID: int(msg.ReplyToID),
+		ChatTitle:    chatTitleOf(msg.Chat),
 		Raw:          msg,
 	}
 	// Chat-type flags. mtgo's Chat may be nil when the peer is not cached;
@@ -1349,6 +1478,14 @@ func convertMessage(msg *types.Message) IncomingMsg {
 	in.IsCommand, in.CommandName, in.Args = parseCommand(msg)
 	in.Media = extractMediaInfo(msg, msg.ChatID)
 	return in
+}
+
+// chatTitleOf extracts the display title of a resolved chat (nil-safe).
+func chatTitleOf(chat *types.Chat) string {
+	if chat == nil {
+		return ""
+	}
+	return chat.Title
 }
 
 // convertCallback maps mtgo's callback wrapper onto the seam type.

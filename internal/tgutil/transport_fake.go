@@ -134,6 +134,10 @@ type FakeTransport struct {
 	// Messages backs GetMessagesBulk and GetReplyMessage as
 	// chatID → msgID → message.
 	Messages map[int64]map[int]IncomingMsg
+	// Chats backs ResolveChat (ref → chat). Refs are the exact strings the
+	// caller passes (numeric marked IDs as decimal strings, or usernames
+	// without the leading "@"). Missing entries fail with FakeNotFound.
+	Chats map[string]ChatInfo
 
 	// Calls records every outbound mutating call in order (see the Call*
 	// constants). Appends are mutex-guarded; tests read it between actions.
@@ -142,6 +146,7 @@ type FakeTransport struct {
 	// --- internal state (mutex-guarded) ---
 	mu          sync.Mutex
 	injected    int
+	msgSeq      int // synthetic message IDs handed out by SendHTMLMsg
 	handlerErrs []error
 	unrouted    []CallbackQuery
 	anyMsg      []msgHandler
@@ -374,6 +379,18 @@ func (f *FakeTransport) SendHTML(_ context.Context, chatID int64, html string, m
 	return nil
 }
 
+// SendHTMLMsg records the call (under CallSendHTML, with MsgID set to the
+// returned message ID) and returns a fresh non-zero synthetic message ID so
+// status-edit flows can be asserted end to end.
+func (f *FakeTransport) SendHTMLMsg(_ context.Context, chatID int64, html string, markup any, replyTo int) (int, error) {
+	f.mu.Lock()
+	f.msgSeq++
+	id := f.msgSeq
+	f.mu.Unlock()
+	f.record(FakeCall{Method: CallSendHTML, ChatID: chatID, MsgID: id, HTML: html, Markup: markup, ReplyTo: replyTo})
+	return id, nil
+}
+
 // EditHTML records the call and returns nil.
 func (f *FakeTransport) EditHTML(_ context.Context, chatID int64, msgID int, html string, markup any) error {
 	f.record(FakeCall{Method: CallEditHTML, ChatID: chatID, MsgID: msgID, HTML: html, Markup: markup})
@@ -530,6 +547,19 @@ func (f *FakeTransport) ResolveUsername(_ context.Context, username string) (Use
 		return UserInfo{}, fmt.Errorf("%w: username %q", FakeNotFound, username)
 	}
 	return u, nil
+}
+
+// ResolveChat looks up Chats by ref (a leading "@" is ignored); missing
+// entries fail with FakeNotFound.
+func (f *FakeTransport) ResolveChat(_ context.Context, ref string) (ChatInfo, error) {
+	ref = strings.TrimPrefix(strings.TrimSpace(ref), "@")
+	f.mu.Lock()
+	c, ok := f.Chats[ref]
+	f.mu.Unlock()
+	if !ok {
+		return ChatInfo{}, fmt.Errorf("%w: chat %q", FakeNotFound, ref)
+	}
+	return c, nil
 }
 
 // GetChatMemberStatus reads MemberStatus (chatID → userID → status); missing

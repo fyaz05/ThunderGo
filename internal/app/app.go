@@ -22,18 +22,20 @@ import (
 	"github.com/fyaz05/ThunderGo/internal/ratelimit"
 	"github.com/fyaz05/ThunderGo/internal/shortener"
 	"github.com/fyaz05/ThunderGo/internal/store"
+	"github.com/fyaz05/ThunderGo/internal/tgutil"
 )
 
 // App is the running application.
 type App struct {
-	Cfg      *config.Config
-	Log      *slog.Logger
-	Store    *store.Store
-	Pool     *pool.Pool
-	Ingester *ingest.Ingester
-	Bot      *bot.Bot
-	HTTP     *tghttp.Server
-	Limiter  *ratelimit.Limiter
+	Cfg          *config.Config
+	Log          *slog.Logger
+	Store        *store.Store
+	Pool         *pool.Pool
+	Ingester     *ingest.Ingester
+	Bot          *bot.Bot
+	BotTransport *tgutil.MTGOTransport
+	HTTP         *tghttp.Server
+	Limiter      *ratelimit.Limiter
 
 	// touchBuffer batches seen_count increments. Created in New(), stopped
 	// in Run() BEFORE Store.Close() so the final BulkWrite flush doesn't
@@ -96,7 +98,25 @@ func New() (*App, error) {
 		return nil, fmt.Errorf("starting telegram pool: %w", err)
 	}
 
-	ingester := ingest.New(p, st, cfg.VaultChannelID, logger)
+	// Bot transport: one dedicated mtgo client for the bot layer, distinct
+	// from the gogram download pool (Phase 3 replaces the pool; until then
+	// the two stacks run side by side — tag their logs accordingly).
+	botTransport, err := newBotTransport(cfg, logger)
+	if err != nil {
+		p.Stop(context.Background())
+		touchBuffer.Stop() // drain flush goroutine before mongo disconnect
+		_ = st.Close(ctx)
+		return nil, fmt.Errorf("building bot transport: %w", err)
+	}
+	if err := botTransport.Start(ctx); err != nil { // bounded by the 30s startup ctx
+		_ = botTransport.Stop()
+		p.Stop(context.Background())
+		touchBuffer.Stop() // drain flush goroutine before mongo disconnect
+		_ = st.Close(ctx)
+		return nil, fmt.Errorf("starting bot transport: %w", err)
+	}
+
+	ingester := ingest.New(botTransport, st, cfg.VaultChannelID, logger)
 	stopDedupCleanup := ingester.StartDedupCleanup(10 * time.Minute)
 
 	limiter := ratelimit.New(cfg.RateLimit, 60*time.Second) // window hardcoded to 60s = "per minute"
@@ -106,13 +126,14 @@ func New() (*App, error) {
 
 	sh, _ := shortener.New(cfg.ShortenerAPIKey, cfg.ShortenerSite, logger)
 
-	b := bot.New(cfg, p, st, ingester, sh, limiter, logger)
+	b := bot.New(cfg, botTransport, p, st, ingester, sh, limiter, logger)
 	if err := b.Start(ctx); err != nil {
 		// RA-A-009: stop background sweeps BEFORE the pool so they
 		// don't race against pool teardown.
 		stopDedupCleanup()
 		stopSweep()
 		b.Stop() // RA-A-002: drain handlers even though Start reported failure
+		_ = botTransport.Stop()
 		p.Stop(context.Background())
 		touchBuffer.Stop() // drain flush goroutine before mongo disconnect
 		_ = st.Close(ctx)
@@ -127,6 +148,7 @@ func New() (*App, error) {
 		stopDedupCleanup()
 		stopSweep()
 		b.Stop()
+		_ = botTransport.Stop()
 		p.Stop(context.Background())
 		touchBuffer.Stop() // drain flush goroutine before mongo disconnect
 		_ = st.Close(ctx)
@@ -140,6 +162,7 @@ func New() (*App, error) {
 		Pool:             p,
 		Ingester:         ingester,
 		Bot:              b,
+		BotTransport:     botTransport,
 		HTTP:             httpServer,
 		Limiter:          limiter,
 		touchBuffer:      touchBuffer,
@@ -230,6 +253,14 @@ func (a *App) Run() error {
 	case <-shutdownCtx.Done():
 		a.Log.Warn("bot stop timed out; some handlers may still be running")
 	}
+	// TRANSITIONAL (Phase 2): the bot runs on its own mtgo transport while
+	// the download pool still runs gogram. Stop the bot transport after the
+	// handlers have drained (they use it) and BEFORE the pool, so the bot
+	// stops consuming updates while the download clients wind down. Phase 3
+	// collapses the two stacks and this ordering note goes away.
+	if err := a.BotTransport.Stop(); err != nil {
+		a.Log.Warn("bot transport stop error", "error", err)
+	}
 	a.Pool.Stop(shutdownCtx)
 	// Stop the touch buffer BEFORE closing the store so the final BulkWrite
 	// flush completes against a live mongo client (audit 9.3). Stop() closes
@@ -243,4 +274,27 @@ func (a *App) Run() error {
 	}
 	a.Log.Info("shutdown complete")
 	return shutdownErr
+}
+
+// newBotTransport constructs the mtgo-backed transport the bot layer runs on.
+// The bot session is persisted in MongoDB (database "thundergo") when a Mongo
+// URI is configured, so the bot keeps its auth keys across restarts; otherwise
+// mtgo's in-memory storage is used (fresh bot login per boot).
+func newBotTransport(cfg *config.Config, logger *slog.Logger) (*tgutil.MTGOTransport, error) {
+	var botStorage any
+	if cfg.MongoURI != "" {
+		st, err := tgutil.MongoStorage(cfg.MongoURI, "thundergo")
+		if err != nil {
+			return nil, err
+		}
+		botStorage = st
+	}
+	return tgutil.NewMTGOTransport(tgutil.MTGOConfig{
+		APIID:       cfg.APIID,
+		APIHash:     cfg.APIHash,
+		BotToken:    cfg.BotToken,
+		SessionName: "bot-00",
+		Storage:     botStorage,
+		Log:         logger.With("component", "bot-transport"),
+	})
 }

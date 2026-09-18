@@ -10,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/amarnathcjd/gogram/telegram"
-
 	"github.com/fyaz05/ThunderGo/internal/store"
 	"github.com/fyaz05/ThunderGo/internal/tgutil"
 )
@@ -33,21 +31,26 @@ func (b *Bot) handleStart(c *Context) error {
 		return nil // consumeActivation succeeded; welcome already sent
 	}
 
-	sender := c.Msg.Sender
-	firstName := ""
-	lastName := ""
-	username := ""
-	if sender != nil {
-		firstName = sender.FirstName
-		lastName = sender.LastName
-		username = sender.Username
+	// The seam's IncomingMsg carries only the sender ID; fetch the profile
+	// for the display name (best-effort — anonymous/unknown senders get
+	// empty names, same as a missing sender object did before).
+	var sender tgutil.UserInfo
+	if c.Msg.SenderID != 0 {
+		if u, err := b.Backend.GetUser(c.Ctx, c.Msg.SenderID); err == nil {
+			sender = u
+		} else {
+			b.Log.Debug("fetching sender profile for /start", "user_id", c.Msg.SenderID, "error", err)
+		}
 	}
+	firstName := sender.FirstName
+	lastName := sender.LastName
+	username := sender.Username
 
 	now := time.Now()
 	upsertCtx, upsertCancel := context.WithTimeout(b.baseCtx, 10*time.Second)
 	defer upsertCancel()
-	inserted, err := b.Store.UpsertUser(upsertCtx, store.User{
-		UserID:    c.Msg.SenderID(),
+	inserted, err := b.st().UpsertUser(upsertCtx, store.User{
+		UserID:    c.Msg.SenderID,
 		FirstName: firstName,
 		LastName:  lastName,
 		Username:  username,
@@ -58,12 +61,11 @@ func (b *Bot) handleStart(c *Context) error {
 	}
 
 	if inserted && b.Cfg.OwnerUserID != 0 {
-		b.notifyNewUser(firstName, lastName, username, c.Msg.SenderID())
+		b.notifyNewUser(c.Ctx, firstName, lastName, username, c.Msg.SenderID)
 	}
 
 	welcome := fmt.Sprintf(msgWelcome, html.EscapeString(firstName), b.Cfg.BatchCap)
-	opts := &telegram.SendOptions{ParseMode: "HTML", ReplyMarkup: buildStartMarkup(b.Cfg.ForceSubChannelID != 0, b.forceSubLink, b.forceSubTitle)}
-	_, _ = c.Msg.Respond(welcome, opts)
+	_, _ = c.RespondMarkup(welcome, buildStartMarkup(b.Cfg.ForceSubChannelID != 0, b.forceSubLink, b.forceSubTitle))
 	return nil
 }
 
@@ -76,20 +78,20 @@ func (b *Bot) consumeActivation(c *Context) error {
 
 	// ConsumeActivationToken is an atomic FindOneAndDelete, so concurrent
 	// /start requests with the same token cannot both succeed.
-	if err := b.Store.ConsumeActivationToken(actCtx, payload); err != nil {
-		b.Log.Info("activation token rejected", "user_id", c.Msg.SenderID(), "error", err)
+	if err := b.st().ConsumeActivationToken(actCtx, payload); err != nil {
+		b.Log.Info("activation token rejected", "user_id", c.Msg.SenderID, "error", err)
 		_, _ = c.ReplyFormatted(msgActivationInvalid)
 		return err
 	}
 
 	ttl := time.Duration(b.Cfg.TokenTTLHours) * time.Hour
-	if err := b.Store.ActivateUser(actCtx, c.Msg.SenderID(), ttl); err != nil {
-		b.Log.Warn("activating user", "user_id", c.Msg.SenderID(), "error", err)
+	if err := b.st().ActivateUser(actCtx, c.Msg.SenderID, ttl); err != nil {
+		b.Log.Warn("activating user", "user_id", c.Msg.SenderID, "error", err)
 		_, _ = c.ReplyFormatted(msgErrInternal)
 		return err
 	}
 
-	b.Log.Info("user activated", "user_id", c.Msg.SenderID(), "ttl_hours", b.Cfg.TokenTTLHours)
+	b.Log.Info("user activated", "user_id", c.Msg.SenderID, "ttl_hours", b.Cfg.TokenTTLHours)
 	_, _ = c.ReplyFormatted(fmt.Sprintf(msgActivated, formatDuration(ttl)))
 	return nil
 }
@@ -110,11 +112,7 @@ func formatDuration(d time.Duration) string {
 	}
 }
 
-func (b *Bot) notifyNewUser(first, last, username string, userID int64) {
-	primary := b.Pool.Primary()
-	if primary == nil {
-		return
-	}
+func (b *Bot) notifyNewUser(ctx context.Context, first, last, username string, userID int64) {
 	name := html.EscapeString(strings.TrimSpace(first + " " + last))
 	// Use @username as display name if present, else the full name.
 	displayName := name
@@ -122,15 +120,13 @@ func (b *Bot) notifyNewUser(first, last, username string, userID int64) {
 		displayName = "@" + html.EscapeString(username)
 	}
 	text := fmt.Sprintf(msgNewUser, userID, displayName, userID)
-	_, err := primary.SendMessage(b.Cfg.VaultChannelID, text, &telegram.SendOptions{ParseMode: "HTML"})
-	if err != nil {
+	if err := b.Backend.SendHTML(ctx, b.Cfg.VaultChannelID, text, nil, 0); err != nil {
 		b.Log.Warn("posting new-user notification to vault", "error", err)
 	}
 }
 
 func (b *Bot) handleHelp(c *Context) error {
-	opts := &telegram.SendOptions{ParseMode: "HTML", ReplyMarkup: buildHelpMarkup(b.Cfg.ForceSubChannelID != 0, b.forceSubLink, b.forceSubTitle)}
-	_, _ = c.Msg.Respond(b.buildHelpText(), opts)
+	_, _ = c.RespondMarkup(b.buildHelpText(), buildHelpMarkup(b.Cfg.ForceSubChannelID != 0, b.forceSubLink, b.forceSubTitle))
 	return nil
 }
 
@@ -191,26 +187,23 @@ func (b *Bot) buildHelpText() string {
 
 func (b *Bot) handlePing(c *Context) error {
 	start := time.Now()
-	sent, _ := c.Reply(msgPinging)
-	if sent == nil {
-		// c.Reply can return (nil, nil); fall back to Respond.
+	sent, err := c.Reply(msgPinging)
+	if err != nil || sent.ID == 0 {
+		// The reply could not be posted; fall back to Respond.
 		_, _ = c.Respond(msgErrPostStatus)
 		return nil
 	}
 	elapsed := time.Since(start)
 	editText := fmt.Sprintf(msgPong, float64(elapsed.Microseconds())/1000.0)
-	_, _ = c.Msg.Client.EditMessage(c.Msg.ChatID(), sent.ID, editText, &telegram.SendOptions{
-		ParseMode:   "HTML",
-		ReplyMarkup: buildPingMarkup(),
-	})
+	_ = b.Backend.EditHTML(c.Ctx, c.Msg.ChatID, sent.ID, editText, buildPingMarkup())
 	return nil
 }
 
-func buildPingMarkup() *telegram.ReplyInlineMarkup {
-	return telegram.NewKeyboard().
+func buildPingMarkup() tgutil.Markup {
+	return tgutil.NewKeyboard().
 		AddRow(
-			telegram.Button.Data(theme.Help+" Help", "help"),
-			telegram.Button.Data(theme.Close+" Close", "close"),
+			tgutil.InlineCallback(theme.Help+" Help", "help"),
+			tgutil.InlineCallback(theme.Close+" Close", "close"),
 		).
 		Build()
 }
@@ -218,77 +211,67 @@ func buildPingMarkup() *telegram.ReplyInlineMarkup {
 // handleDc reports the data center of a file or user. The owner can pass a
 // user ID or @username as an argument.
 func (b *Bot) handleDc(c *Context) error {
-	if c.Msg.IsReply() {
-		reply, err := c.Msg.GetReplyMessage()
-		if err == nil && reply != nil && reply.IsMedia() {
-			dc := 0
-			if doc := reply.Document(); doc != nil {
-				dc = int(doc.DcID)
-			} else if p := reply.Photo(); p != nil {
-				dc = int(p.DcID)
-			}
-			name, _ := tgutil.ExtractFileName(reply)
-			typeDisplay := friendlyFileType(reply)
+	if c.Msg.ReplyToMsgID != 0 {
+		reply, err := b.Backend.GetReplyMessage(c.Ctx, c.Msg.ChatID, c.Msg.MsgID)
+		if err == nil && reply.Media != nil {
+			name := reply.Media.Name
+			typeDisplay := friendlyFileType(reply.Media.Kind)
 			text := fmt.Sprintf(msgFileDC,
 				html.EscapeString(name),
-				tgutil.FormatBytes(tgutil.ExtractSize(reply)),
+				tgutil.FormatBytes(reply.Media.Size),
 				html.EscapeString(typeDisplay),
-				dc)
-			opts := &telegram.SendOptions{ParseMode: "HTML", ReplyMarkup: buildCloseMarkup()}
-			_, _ = c.Msg.Respond(text, opts)
+				reply.Media.DC)
+			_, _ = c.RespondMarkup(text, buildCloseMarkup())
 			return nil
 		}
-		if err == nil && reply != nil && reply.Sender != nil {
-			dc := userDCFromPhoto(reply.Sender)
-			name := reply.Sender.FirstName
-			if name == "" {
-				name = msgFallbackUserName
+		if err == nil && reply.SenderID != 0 {
+			if sender, uErr := b.Backend.GetUser(c.Ctx, reply.SenderID); uErr == nil {
+				dc := userDCFromPhoto(sender)
+				name := sender.FirstName
+				if name == "" {
+					name = msgFallbackUserName
+				}
+				text := fmt.Sprintf(msgUserDC, sender.ID, html.EscapeString(name), sender.ID, dc)
+				_, _ = c.RespondMarkup(text, buildUserDCMarkup(sender))
+				return nil
 			}
-			text := fmt.Sprintf(msgUserDC, reply.Sender.ID, html.EscapeString(name), reply.Sender.ID, dc)
-			opts := &telegram.SendOptions{ParseMode: "HTML", ReplyMarkup: buildUserDCMarkup(reply.Sender)}
-			_, _ = c.Msg.Respond(text, opts)
-			return nil
 		}
 	}
 
 	if c.IsOwner && c.Args != "" {
-		target, err := resolveUser(b.Pool.Primary().Client, c.Args)
-		if err == nil && target != nil {
+		target, err := resolveUser(c.Ctx, b.Backend, c.Args)
+		if err == nil && target.ID != 0 {
 			dc := userDCFromPhoto(target)
 			name := target.FirstName
 			if name == "" {
 				name = msgFallbackUserName
 			}
 			text := fmt.Sprintf(msgUserDC, target.ID, html.EscapeString(name), target.ID, dc)
-			opts := &telegram.SendOptions{ParseMode: "HTML", ReplyMarkup: buildUserDCMarkup(target)}
-			_, _ = c.Msg.Respond(text, opts)
+			_, _ = c.RespondMarkup(text, buildUserDCMarkup(target))
 			return nil
 		}
 		_, _ = c.ReplyFormatted(msgDCInvalidUsage)
 		return nil
 	}
 
-	sender := c.Msg.Sender
-	if sender != nil {
-		dc := userDCFromPhoto(sender)
-		name := sender.FirstName
-		if name == "" {
-			name = msgFallbackUserName
+	if c.Msg.SenderID != 0 {
+		if sender, err := b.Backend.GetUser(c.Ctx, c.Msg.SenderID); err == nil {
+			dc := userDCFromPhoto(sender)
+			name := sender.FirstName
+			if name == "" {
+				name = msgFallbackUserName
+			}
+			text := fmt.Sprintf(msgYourDC, sender.ID, html.EscapeString(name), sender.ID, dc)
+			_, _ = c.RespondMarkup(text, buildCloseMarkup())
+			return nil
 		}
-		text := fmt.Sprintf(msgYourDC, sender.ID, html.EscapeString(name), sender.ID, dc)
-		opts := &telegram.SendOptions{ParseMode: "HTML", ReplyMarkup: buildCloseMarkup()}
-		_, _ = c.Msg.Respond(text, opts)
-		return nil
 	}
 	_, _ = c.ReplyFormatted(msgDCAnonError)
 	return nil
 }
 
-func friendlyFileType(m *telegram.NewMessage) string {
-	if m == nil {
-		return msgFileTypeUnknown
-	}
-	switch tgutil.MediaType(m) {
+func friendlyFileType(kind string) string {
+	switch kind {
 	case "video":
 		return msgFileTypeVideo
 	case "photo":
@@ -308,55 +291,42 @@ func friendlyFileType(m *telegram.NewMessage) string {
 	}
 }
 
-func buildUserDCMarkup(u *telegram.UserObj) *telegram.ReplyInlineMarkup {
+func buildUserDCMarkup(u tgutil.UserInfo) tgutil.Markup {
 	profileURL := fmt.Sprintf("tg://user?id=%d", u.ID)
 	if u.Username != "" {
 		profileURL = "https://t.me/" + u.Username
 	}
-	return telegram.NewKeyboard().
-		AddRow(telegram.Button.URL("👤 View Profile", profileURL)).
-		AddRow(telegram.Button.Data(theme.Close+" Close", "close")).
+	return tgutil.NewKeyboard().
+		AddRow(tgutil.InlineURL("👤 View Profile", profileURL)).
+		AddRow(tgutil.InlineCallback(theme.Close+" Close", "close")).
 		Build()
 }
 
-func userDCFromPhoto(u *telegram.UserObj) int {
-	if u == nil || u.Photo == nil {
-		return 0
-	}
-	// The user's profile photo carries the DC where it lives.
-	if p, ok := u.Photo.(*telegram.UserProfilePhotoObj); ok {
-		return int(p.DcID)
-	}
-	return 0
+func userDCFromPhoto(u tgutil.UserInfo) int {
+	// The user's profile photo carries the DC where it lives; the seam
+	// surfaces it as PhotoDC (0 when unknown).
+	return u.PhotoDC
 }
 
-func resolveUser(c *telegram.Client, ref string) (*telegram.UserObj, error) {
+func resolveUser(ctx context.Context, be tgutil.BotBackend, ref string) (tgutil.UserInfo, error) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
-		return nil, fmt.Errorf("empty reference")
+		return tgutil.UserInfo{}, fmt.Errorf("empty reference")
 	}
 	if strings.HasPrefix(ref, "@") {
-		ent, err := c.ResolveUsername(strings.TrimPrefix(ref, "@"))
-		if err != nil {
-			return nil, err
-		}
-		if u, ok := ent.(*telegram.UserObj); ok {
-			return u, nil
-		}
-		return nil, fmt.Errorf("not a user")
+		return be.ResolveUsername(ctx, strings.TrimPrefix(ref, "@"))
 	}
 	userID, err := strconv.ParseInt(ref, 10, 64)
 	if err != nil {
-		return nil, err
+		return tgutil.UserInfo{}, err
 	}
-	return c.GetUser(userID)
+	return be.GetUser(ctx, userID)
 }
 
 // handleAbout: <a href> in the text makes the link copy-pasteable on
 // clients that hide inline-button URLs.
 func (b *Bot) handleAbout(c *Context) error {
-	opts := &telegram.SendOptions{ParseMode: "HTML", ReplyMarkup: buildAboutMarkup()}
-	_, _ = c.Msg.Respond(buildAboutText(), opts)
+	_, _ = c.RespondMarkup(buildAboutText(), buildAboutMarkup())
 	return nil
 }
 
@@ -377,7 +347,7 @@ I'm your go-to bot for <b>instant download &amp; streaming links</b> from Telegr
 
 <b>🛠️ Tech Stack</b>
 <blockquote>🐹 <b>Language:</b> Go 1.26
-📚 <b>Telegram Library:</b> gogram
+📚 <b>Telegram Library:</b> mtgo
 🍃 <b>Database:</b> MongoDB
 🌐 <b>HTTP Router:</b> chi</blockquote>
 
@@ -389,57 +359,57 @@ I'm your go-to bot for <b>instant download &amp; streaming links</b> from Telegr
 }
 
 // buildAboutMarkup is shared by /about and the "about" callback.
-func buildAboutMarkup() *telegram.ReplyInlineMarkup {
-	return telegram.NewKeyboard().
-		AddRow(telegram.Button.Data(theme.Help+" Help", "help")).
+func buildAboutMarkup() tgutil.Markup {
+	return tgutil.NewKeyboard().
+		AddRow(tgutil.InlineCallback(theme.Help+" Help", "help")).
 		AddRow(
-			telegram.Button.URL(theme.GitHub+" GitHub", "https://github.com/fyaz05/ThunderGo"),
-			telegram.Button.URL(theme.Community+" Community", communityLink),
+			tgutil.InlineURL(theme.GitHub+" GitHub", "https://github.com/fyaz05/ThunderGo"),
+			tgutil.InlineURL(theme.Community+" Community", communityLink),
 		).
-		AddRow(telegram.Button.Data(theme.Close+" Close", "close")).
+		AddRow(tgutil.InlineCallback(theme.Close+" Close", "close")).
 		Build()
 }
 
 // buildStartMarkup adds a Join Channel row when force-sub is configured.
-func buildStartMarkup(hasForceSub bool, forceSubLink, forceSubTitle string) *telegram.ReplyInlineMarkup {
-	kb := telegram.NewKeyboard().
+func buildStartMarkup(hasForceSub bool, forceSubLink, forceSubTitle string) tgutil.Markup {
+	kb := tgutil.NewKeyboard().
 		AddRow(
-			telegram.Button.Data(theme.Help+" Help", "help"),
-			telegram.Button.Data(theme.About+" About", "about"),
+			tgutil.InlineCallback(theme.Help+" Help", "help"),
+			tgutil.InlineCallback(theme.About+" About", "about"),
 		).
 		AddRow(
-			telegram.Button.URL(theme.GitHub+" GitHub", "https://github.com/fyaz05/ThunderGo"),
-			telegram.Button.URL(theme.Community+" Community", communityLink),
-			telegram.Button.Data(theme.Close+" Close", "close"),
+			tgutil.InlineURL(theme.GitHub+" GitHub", "https://github.com/fyaz05/ThunderGo"),
+			tgutil.InlineURL(theme.Community+" Community", communityLink),
+			tgutil.InlineCallback(theme.Close+" Close", "close"),
 		)
 	if hasForceSub && forceSubLink != "" {
 		label := theme.Join + " Join Channel"
 		if forceSubTitle != "" {
 			label = theme.Join + " Join " + forceSubTitle
 		}
-		kb = kb.AddRow(telegram.Button.URL(label, forceSubLink))
+		kb = kb.AddRow(tgutil.InlineURL(label, forceSubLink))
 	}
 	return kb.Build()
 }
 
 // buildHelpMarkup adds a Join Channel row when force-sub is configured.
-func buildHelpMarkup(hasForceSub bool, forceSubLink, forceSubTitle string) *telegram.ReplyInlineMarkup {
-	kb := telegram.NewKeyboard().
-		AddRow(telegram.Button.Data(theme.About+" About", "about"))
+func buildHelpMarkup(hasForceSub bool, forceSubLink, forceSubTitle string) tgutil.Markup {
+	kb := tgutil.NewKeyboard().
+		AddRow(tgutil.InlineCallback(theme.About+" About", "about"))
 	if hasForceSub && forceSubLink != "" {
 		label := theme.Join + " Join Channel"
 		if forceSubTitle != "" {
 			label = theme.Join + " Join " + forceSubTitle
 		}
-		kb = kb.AddRow(telegram.Button.URL(label, forceSubLink))
+		kb = kb.AddRow(tgutil.InlineURL(label, forceSubLink))
 	}
-	kb = kb.AddRow(telegram.Button.Data(theme.Close+" Close", "close"))
+	kb = kb.AddRow(tgutil.InlineCallback(theme.Close+" Close", "close"))
 	return kb.Build()
 }
 
-func buildCloseMarkup() *telegram.ReplyInlineMarkup {
-	return telegram.NewKeyboard().
-		AddRow(telegram.Button.Data(theme.Close+" Close", "close")).
+func buildCloseMarkup() tgutil.Markup {
+	return tgutil.NewKeyboard().
+		AddRow(tgutil.InlineCallback(theme.Close+" Close", "close")).
 		Build()
 }
 
@@ -481,8 +451,7 @@ func (b *Bot) handleStats(c *Context) error {
 	sb.WriteString(fmt.Sprintf("⚡ <b>Total in-flight:</b> <code>%d</code>", b.Pool.TotalInflight()))
 	sb.WriteString("</blockquote>")
 
-	opts := &telegram.SendOptions{ParseMode: "HTML", ReplyMarkup: buildCloseMarkup()}
-	_, _ = c.Msg.Respond(sb.String(), opts)
+	_, _ = c.RespondMarkup(sb.String(), buildCloseMarkup())
 	return nil
 }
 
@@ -513,75 +482,57 @@ func formatReadableDuration(d time.Duration) string {
 
 // handleHelpCallback edits the message so the chat stays clean.
 
-func (b *Bot) handleHelpCallback(cq *telegram.CallbackQuery) error {
-	if cq == nil {
-		return nil
-	}
-	_, _ = cq.Answer(msgCallbackHelpAnswered)
+func (b *Bot) handleHelpCallback(ctx context.Context, cq tgutil.CallbackQuery) error {
+	_ = b.Backend.AnswerCallback(ctx, cq, msgCallbackHelpAnswered, false, "")
 
-	opts := &telegram.SendOptions{
-		ParseMode:   "HTML",
-		ReplyMarkup: buildHelpMarkup(b.Cfg.ForceSubChannelID != 0, b.forceSubLink, b.forceSubTitle),
-	}
-	_, err := cq.Edit(b.buildHelpText(), opts)
+	markup := buildHelpMarkup(b.Cfg.ForceSubChannelID != 0, b.forceSubLink, b.forceSubTitle)
+	err := b.Backend.CallbackEditHTML(ctx, cq, b.buildHelpText(), markup)
 	if err != nil {
 		// Fallback: send as a new message if edit fails (e.g. message too old).
 		b.Log.Debug("help callback: edit failed, sending new message", "error", err)
-		_, _ = cq.Client.SendMessage(cq.GetChatID(), b.buildHelpText(), opts)
+		_ = b.Backend.SendHTML(ctx, cq.ChatID, b.buildHelpText(), markup, 0)
 	}
 	return nil
 }
 
-func (b *Bot) handleAboutCallback(cq *telegram.CallbackQuery) error {
-	if cq == nil {
-		return nil
-	}
-	_, _ = cq.Answer(msgCallbackAboutAnswered)
+func (b *Bot) handleAboutCallback(ctx context.Context, cq tgutil.CallbackQuery) error {
+	_ = b.Backend.AnswerCallback(ctx, cq, msgCallbackAboutAnswered, false, "")
 
-	opts := &telegram.SendOptions{
-		ParseMode:   "HTML",
-		ReplyMarkup: buildAboutMarkup(),
-	}
-	_, err := cq.Edit(buildAboutText(), opts)
+	markup := buildAboutMarkup()
+	err := b.Backend.CallbackEditHTML(ctx, cq, buildAboutText(), markup)
 	if err != nil {
 		b.Log.Debug("about callback: edit failed, sending new message", "error", err)
-		_, _ = cq.Client.SendMessage(cq.GetChatID(), buildAboutText(), opts)
+		_ = b.Backend.SendHTML(ctx, cq.ChatID, buildAboutText(), markup, 0)
 	}
 	return nil
 }
 
 // handleCloseCallback: best-effort delete. Only the original recipient (private
 // chats) or the bot owner can close.
-func (b *Bot) handleCloseCallback(cq *telegram.CallbackQuery) error {
-	if cq == nil {
+func (b *Bot) handleCloseCallback(ctx context.Context, cq tgutil.CallbackQuery) error {
+	if cq.SenderID != cq.ChatID && !b.Cfg.IsOwner(cq.SenderID) {
+		_ = b.Backend.AnswerCallback(ctx, cq, msgCallbackCloseDenied, true, "")
 		return nil
 	}
-	if cq.SenderID != cq.GetChatID() && !b.Cfg.IsOwner(cq.SenderID) {
-		_, _ = cq.Answer(msgCallbackCloseDenied, &telegram.CallbackOptions{Alert: true})
-		return nil
-	}
-	_, _ = cq.Answer(msgCallbackCloseAnswered)
-	_, err := cq.Client.DeleteMessages(cq.GetChatID(), []int32{cq.MessageID})
-	if err != nil {
+	_ = b.Backend.AnswerCallback(ctx, cq, msgCallbackCloseAnswered, false, "")
+	if err := b.Backend.DeleteMessages(ctx, cq.ChatID, cq.MessageID); err != nil {
 		b.Log.Debug("close callback: could not delete message",
-			"chat_id", cq.GetChatID(), "msg_id", cq.MessageID, "error", err)
+			"chat_id", cq.ChatID, "msg_id", cq.MessageID, "error", err)
 	}
 	return nil
 }
 
 // handleUnsupportedCallback prevents unknown buttons leaving the user with a
 // perpetual "Loading…" spinner.
-func (b *Bot) handleUnsupportedCallback(cq *telegram.CallbackQuery) error {
-	if cq == nil {
-		return nil
-	}
-	// OnCallbackQuery matches all callbacks, but specific handlers in the
-	// DefaultGroup may have already answered this one.
-	data := cq.DataString()
+func (b *Bot) handleUnsupportedCallback(ctx context.Context, cq tgutil.CallbackQuery) error {
+	// The catch-all route matches every callback, but specific handlers may
+	// have already answered this one (the backend routes longest-prefix
+	// first, so this only fires for genuinely unrouted data).
+	data := cq.Data
 	if knownCallbacks[data] || strings.HasPrefix(data, "cancel_") {
 		return nil
 	}
-	_, _ = cq.Answer(msgCallbackUnsupported, &telegram.CallbackOptions{Alert: true})
+	_ = b.Backend.AnswerCallback(ctx, cq, msgCallbackUnsupported, true, "")
 	b.Log.Debug("unsupported callback", "data", data, "sender_id", cq.SenderID)
 	return nil
 }

@@ -10,8 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/amarnathcjd/gogram/telegram"
-
 	"github.com/fyaz05/ThunderGo/internal/ingest"
 	"github.com/fyaz05/ThunderGo/internal/store"
 	"github.com/fyaz05/ThunderGo/internal/tgutil"
@@ -22,17 +20,17 @@ import (
 func (b *Bot) handleLink(c *Context) error {
 	batchCap := b.Cfg.BatchCap
 
-	if c.Msg.IsPrivate() {
+	if c.Msg.IsPrivate {
 		_, _ = c.ReplyFormatted(msgUsageLinkGroup)
 		return nil
 	}
 
-	if !b.botIsAdminIn(c.Msg) {
+	if !b.botIsAdminIn(c.Ctx, c.Msg.ChatID) {
 		_, _ = c.ReplyFormatted(msgErrNotAdmin)
 		return nil
 	}
 
-	if !c.Msg.IsReply() {
+	if c.Msg.ReplyToMsgID == 0 {
 		_, _ = c.ReplyFormatted(msgUsageLinkReply)
 		return nil
 	}
@@ -58,25 +56,25 @@ func (b *Bot) handleLink(c *Context) error {
 }
 
 func (b *Bot) linkSingle(c *Context) error {
-	status, _ := c.Reply(msgProcessing)
-	if status == nil {
+	status, err := c.Reply(msgProcessing)
+	if err != nil || status.ID == 0 {
 		_, _ = c.ReplyFormatted(msgErrPostStatus)
 		return nil
 	}
-	reply, err := c.Msg.GetReplyMessage()
-	if err != nil || reply == nil {
-		_, _ = b.editStatusSafe(status, msgErrFetchMsg)
+	reply, err := b.Backend.GetReplyMessage(c.Ctx, c.Msg.ChatID, c.Msg.MsgID)
+	if err != nil {
+		_ = b.editStatusSafe(c.Ctx, status, msgErrFetchMsg)
 		return nil
 	}
-	if !reply.IsMedia() {
-		_, _ = b.editStatusSafe(status, msgErrNoMedia)
+	if reply.Media == nil {
+		_ = b.editStatusSafe(c.Ctx, status, msgErrNoMedia)
 		return nil
 	}
 
 	// The user must have started the bot in private chat first.
-	if !b.userHasStarted(c.Msg.SenderID()) {
-		_, _ = b.editStatusSafe(status, msgUsageLinkPrivate)
-		b.userStartedPrompt(c.Msg)
+	if !b.userHasStarted(c.Msg.SenderID) {
+		_ = b.editStatusSafe(c.Ctx, status, msgUsageLinkPrivate)
+		b.userStartedPrompt(c.Ctx, c.Msg)
 		return nil
 	}
 
@@ -85,7 +83,7 @@ func (b *Bot) linkSingle(c *Context) error {
 	result := b.Ingester.Ingest(ctx, reply)
 	if result.Err != nil {
 		b.Log.Warn("link single ingest failed", "error", result.Err)
-		_, _ = b.editStatusSafe(status, msgErrProcessFile)
+		_ = b.editStatusSafe(c.Ctx, status, msgErrProcessFile)
 		return nil
 	}
 
@@ -94,22 +92,22 @@ func (b *Bot) linkSingle(c *Context) error {
 	streamURL, downloadURL = b.maybeShorten(c, streamURL, downloadURL)
 
 	text := formatLinkMessage(result.File, streamURL, downloadURL, result.Reused, b.Cfg.FileTTLDays)
-	b.editStatusWithButtons(status, text, streamURL, downloadURL)
+	b.editStatusWithButtons(c.Ctx, status, text, streamURL, downloadURL)
 
 	// Send the same links in a private message. If the DM fails (user blocked
 	// the bot), tell them in the group.
-	if !b.sendPrivateLinksChecked(c.Msg.SenderID(), result.File, streamURL, downloadURL, result.Reused, chatTitle(c.Msg)) {
-		_, _ = c.Msg.Respond(msgErrDMBlocked)
+	if !b.sendPrivateLinksChecked(c.Ctx, c.Msg.SenderID, result.File, streamURL, downloadURL, result.Reused, c.Msg.ChatTitle) {
+		_, _ = c.Respond(msgErrDMBlocked)
 	}
 
 	// Vault log for fresh ingests only.
 	if !result.Reused {
 		source := ingest.Source{
 			Kind:      "group",
-			UserName:  userName(c.Msg.Sender),
-			UserID:    c.Msg.SenderID(),
-			ChatTitle: chatTitle(c.Msg),
-			ChatID:    c.Msg.ChatID(),
+			UserName:  b.senderName(ctx, c.Msg.SenderID),
+			UserID:    c.Msg.SenderID,
+			ChatTitle: c.Msg.ChatTitle,
+			ChatID:    c.Msg.ChatID,
 		}
 		logCtx, logCancel := context.WithTimeout(b.baseCtx, 30*time.Second)
 		defer logCancel()
@@ -119,21 +117,21 @@ func (b *Bot) linkSingle(c *Context) error {
 }
 
 func (b *Bot) linkBatch(c *Context, n int) error {
-	status, _ := c.Reply(fmt.Sprintf(msgProcessingN, n))
-	if status == nil {
+	status, err := c.Reply(fmt.Sprintf(msgProcessingN, n))
+	if err != nil || status.ID == 0 {
 		_, _ = c.ReplyFormatted(msgErrPostStatus)
 		return nil
 	}
-	reply, err := c.Msg.GetReplyMessage()
-	if err != nil || reply == nil {
-		_, _ = b.editStatusSafe(status, msgErrFetchMsg)
+	reply, err := b.Backend.GetReplyMessage(c.Ctx, c.Msg.ChatID, c.Msg.MsgID)
+	if err != nil {
+		_ = b.editStatusSafe(c.Ctx, status, msgErrFetchMsg)
 		return nil
 	}
 
 	// The user must have started the bot in private chat first.
-	if !b.userHasStarted(c.Msg.SenderID()) {
-		_, _ = b.editStatusSafe(status, msgUsageLinkPrivate)
-		b.userStartedPrompt(c.Msg)
+	if !b.userHasStarted(c.Msg.SenderID) {
+		_ = b.editStatusSafe(c.Ctx, status, msgUsageLinkPrivate)
+		b.userStartedPrompt(c.Ctx, c.Msg)
 		return nil
 	}
 
@@ -141,28 +139,13 @@ func (b *Bot) linkBatch(c *Context, n int) error {
 	batchCtx, batchCancel := context.WithTimeout(b.baseCtx, time.Duration(30+2*n)*time.Second)
 	defer batchCancel()
 
-	// Fetch the next N messages starting from reply.ID. messages.search returns
-	// newest-first, so we reverse the slice below to restore chronological order.
-	primary := b.Pool.Primary()
-	if primary == nil {
-		b.Log.Warn("link batch: no primary client")
-		_, _ = b.editStatusSafe(status, msgErrProcessFile)
-		return nil
-	}
-	//gosec:disable G115 // n is bounded [1, BatchCap] at the caller; BatchCap defaults to 50; reply.ID is int32, +BatchCap cannot overflow
-	msgs, err := primary.GetMessages(c.Msg.ChatID(), &telegram.SearchOption{
-		MinID: reply.ID - 1,
-		MaxID: reply.ID + int32(n),
-		Limit: int32(n),
-	})
-	//gosec:enable G115
+	// Fetch the next N messages starting after the reply. The backend
+	// returns the (minID, maxID] window in chronological order already.
+	msgs, err := b.Backend.GetMessagesBulk(batchCtx, c.Msg.ChatID, reply.MsgID-1, reply.MsgID+n, n)
 	if err != nil {
 		b.Log.Warn("link batch get messages failed", "error", err)
-		_, _ = b.editStatusSafe(status, msgErrProcessFile)
+		_ = b.editStatusSafe(c.Ctx, status, msgErrProcessFile)
 		return nil
-	}
-	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
-		msgs[i], msgs[j] = msgs[j], msgs[i]
 	}
 
 	// chunkSize: max file links per Telegram message (10 links × ~300 chars ≈ ~3000,
@@ -182,17 +165,17 @@ func (b *Bot) linkBatch(c *Context, n int) error {
 			return
 		}
 		groupText := fmt.Sprintf(msgBatchLinksReady, len(chunk)) + "\n\n" + strings.Join(chunk, "\n\n---\n\n")
-		_, _ = c.Msg.Respond(groupText, &telegram.SendOptions{ParseMode: "HTML"})
+		_ = b.Backend.SendHTML(b.baseCtx, c.Msg.ChatID, groupText, nil, 0)
 		// Best-effort DM with batch prefix; failures surfaced via dmFailed at the end.
-		title := chatTitle(c.Msg)
+		title := c.Msg.ChatTitle
 		if title == "" {
 			title = msgFallbackChatTitle
 		}
 		dmText := fmt.Sprintf(msgDMBatchPrefix, html.EscapeString(title)) + "\n" + groupText
-		if _, err := primary.SendMessage(c.Msg.SenderID(), dmText, &telegram.SendOptions{ParseMode: "HTML"}); err != nil {
+		if err := b.Backend.SendHTML(b.baseCtx, c.Msg.SenderID, dmText, nil, 0); err != nil {
 			dmFailed++
 			b.Log.Debug("batch DM send failed",
-				"user_id", c.Msg.SenderID(), "chunk_size", len(chunk), "error", err)
+				"user_id", c.Msg.SenderID, "chunk_size", len(chunk), "error", err)
 		}
 		chunk = chunk[:0]
 		select {
@@ -233,7 +216,7 @@ func (b *Bot) linkBatch(c *Context, n int) error {
 		lastProgressUpdate.Store(processed)
 		text := fmt.Sprintf(msgProcessingStatus, processed, total, failed)
 		progressMu.Lock()
-		_, _ = b.editStatusSafe(status, text)
+		_ = b.editStatusSafe(batchCtx, status, text)
 		progressMu.Unlock()
 	}
 
@@ -263,8 +246,8 @@ func (b *Bot) linkBatch(c *Context, n int) error {
 				if batchCtx.Err() != nil {
 					return
 				}
-				m := &msgs[i]
-				if !m.IsMedia() {
+				m := msgs[i]
+				if m.Media == nil {
 					// Non-media messages in the range are expected; count as skipped
 					// so the failure count reflects only genuine ingestion errors.
 					results[i] = batchResult{index: i, skipped: true}
@@ -317,11 +300,10 @@ func (b *Bot) linkBatch(c *Context, n int) error {
 	flushChunk()
 
 	summary := fmt.Sprintf(msgBatchSummary, succeeded, skipped, failed)
-	_, _ = b.editStatusSafe(status, summary)
+	_ = b.editStatusSafe(b.baseCtx, status, summary)
 	if dmFailed > 0 {
-		_, _ = c.Msg.Respond(
-			fmt.Sprintf(msgBatchDMFailed, dmFailed),
-			&telegram.SendOptions{ParseMode: "HTML"})
+		_ = b.Backend.SendHTML(b.baseCtx, c.Msg.ChatID,
+			fmt.Sprintf(msgBatchDMFailed, dmFailed), nil, 0)
 	}
 	return nil
 }
@@ -329,19 +311,20 @@ func (b *Bot) linkBatch(c *Context, n int) error {
 // handlePrivateMedia ingests a file sent in private chat: posts a status
 // message, processes the file, replaces the status with the links and inline
 // Stream/Download buttons, and posts a vault log.
-func (b *Bot) handlePrivateMedia(m *telegram.NewMessage, isOwner, isAuthorized bool) {
-	status, _ := m.Respond(msgProcessing)
-	if status == nil {
+func (b *Bot) handlePrivateMedia(ctx context.Context, m tgutil.IncomingMsg, isOwner, isAuthorized bool) {
+	id, err := b.Backend.SendHTMLMsg(ctx, m.ChatID, msgProcessing, nil, 0)
+	if err != nil || id == 0 {
 		b.Log.Warn("could not post processing status")
 		return
 	}
+	status := Sent{ChatID: m.ChatID, ID: id}
 
-	ctx, cancel := context.WithTimeout(b.baseCtx, 60*time.Second)
+	ingestCtx, cancel := context.WithTimeout(b.baseCtx, 60*time.Second)
 	defer cancel()
-	result := b.Ingester.Ingest(ctx, m)
+	result := b.Ingester.Ingest(ingestCtx, m)
 	if result.Err != nil {
 		b.Log.Warn("private media ingest failed", "error", result.Err)
-		_, _ = b.editStatusSafe(status, msgErrProcessFile)
+		_ = b.editStatusSafe(ctx, status, msgErrProcessFile)
 		return
 	}
 
@@ -352,10 +335,10 @@ func (b *Bot) handlePrivateMedia(m *telegram.NewMessage, isOwner, isAuthorized b
 	}
 
 	text := formatLinkMessage(result.File, streamURL, downloadURL, result.Reused, b.Cfg.FileTTLDays)
-	b.editStatusWithButtons(status, text, streamURL, downloadURL)
+	b.editStatusWithButtons(ctx, status, text, streamURL, downloadURL)
 
-	source := ingest.Source{Kind: "private", UserName: userName(m.Sender), UserID: m.SenderID()}
 	if !result.Reused {
+		source := ingest.Source{Kind: "private", UserName: b.senderName(ctx, m.SenderID), UserID: m.SenderID}
 		logCtx, logCancel := context.WithTimeout(b.baseCtx, 30*time.Second)
 		defer logCancel()
 		if err := b.Ingester.PostVaultLog(logCtx, result.File, source, streamURL, downloadURL); err != nil {
@@ -366,14 +349,14 @@ func (b *Bot) handlePrivateMedia(m *telegram.NewMessage, isOwner, isAuthorized b
 
 // The bot must be admin in the channel to receive the post at all;
 // we still verify admin status defensively.
-func (b *Bot) handleChannelAutoProcess(m *telegram.NewMessage) {
-	if !b.botIsAdminIn(m) {
-		b.Log.Debug("channel auto-process: bot is not admin in channel; skipping", "chat_id", m.ChatID())
+func (b *Bot) handleChannelAutoProcess(ctx context.Context, m tgutil.IncomingMsg) {
+	if !b.botIsAdminIn(ctx, m.ChatID) {
+		b.Log.Debug("channel auto-process: bot is not admin in channel; skipping", "chat_id", m.ChatID)
 		return
 	}
-	ctx, cancel := context.WithTimeout(b.baseCtx, 60*time.Second)
+	ingestCtx, cancel := context.WithTimeout(b.baseCtx, 60*time.Second)
 	defer cancel()
-	result := b.Ingester.Ingest(ctx, m)
+	result := b.Ingester.Ingest(ingestCtx, m)
 	if result.Err != nil {
 		b.Log.Warn("channel auto-process ingest failed", "error", result.Err)
 		return
@@ -382,21 +365,17 @@ func (b *Bot) handleChannelAutoProcess(m *telegram.NewMessage) {
 	streamURL := b.Cfg.FileURL(result.File.Hash, result.File.FileName)
 	downloadURL := b.Cfg.FileRawURL(result.File.Hash, result.File.FileName)
 
-	kb := telegram.NewKeyboard().
-		AddRow(telegram.Button.URL(theme.Stream+" Stream", streamURL), telegram.Button.URL(theme.Download+" Download", downloadURL)).
+	kb := tgutil.NewKeyboard().
+		AddRow(tgutil.InlineURL(theme.Stream+" Stream", streamURL), tgutil.InlineURL(theme.Download+" Download", downloadURL)).
 		Build()
-	// The original caption is plain text; escape and request ParseMode=HTML so the
-	// wire payload is deterministic across gogram versions.
-	caption := html.EscapeString(m.Text())
-	_, err := m.Client.EditMessage(m.ChatID(), m.ID, caption, &telegram.SendOptions{
-		ParseMode:   "HTML",
-		ReplyMarkup: kb,
-	})
-	if err != nil {
+	// The original caption is plain text; escape and request HTML parse mode
+	// so the wire payload is deterministic across transport versions.
+	caption := html.EscapeString(m.Text)
+	if err := b.Backend.EditHTML(ctx, m.ChatID, m.MsgID, caption, kb); err != nil {
 		b.Log.Warn("editing channel post to attach buttons", "error", err)
 	}
 
-	source := ingest.Source{Kind: "channel", ChatTitle: chatTitle(m), ChatID: m.ChatID()}
+	source := ingest.Source{Kind: "channel", ChatTitle: m.ChatTitle, ChatID: m.ChatID}
 	if !result.Reused {
 		logCtx, logCancel := context.WithTimeout(b.baseCtx, 30*time.Second)
 		defer logCancel()
@@ -478,7 +457,7 @@ func formatBatchLinkMessage(rec *store.FileRecord, streamURL, downloadURL string
 func (b *Bot) userHasStarted(userID int64) bool {
 	ctx, cancel := context.WithTimeout(b.baseCtx, 10*time.Second)
 	defer cancel()
-	has, err := b.Store.HasUser(ctx, userID)
+	has, err := b.st().HasUser(ctx, userID)
 	if err != nil {
 		b.Log.Debug("HasUser lookup failed", "user_id", userID, "error", err)
 		return false
@@ -488,17 +467,15 @@ func (b *Bot) userHasStarted(userID int64) bool {
 
 // Returns false if the DM could not be delivered (user blocked the bot).
 // Includes a "📬 From {chat_title}" prefix when chatTitle is non-empty.
-func (b *Bot) sendPrivateLinksChecked(userID int64, rec *store.FileRecord, streamURL, downloadURL string, reused bool, chatTitle string) bool {
-	primary := b.Pool.Primary()
-	if primary == nil || userID == 0 {
+func (b *Bot) sendPrivateLinksChecked(ctx context.Context, userID int64, rec *store.FileRecord, streamURL, downloadURL string, reused bool, chatTitle string) bool {
+	if b.Backend == nil || userID == 0 {
 		return false
 	}
 	text := formatLinkMessage(rec, streamURL, downloadURL, reused, b.Cfg.FileTTLDays)
 	if chatTitle != "" {
 		text = fmt.Sprintf(msgDMSinglePrefix, html.EscapeString(chatTitle)) + text
 	}
-	_, err := primary.SendMessage(userID, text, &telegram.SendOptions{ParseMode: "HTML"})
-	if err != nil {
+	if err := b.Backend.SendHTML(ctx, userID, text, nil, 0); err != nil {
 		b.Log.Debug("could not DM user (likely blocked)", "user_id", userID, "error", err)
 		return false
 	}
@@ -507,81 +484,63 @@ func (b *Bot) sendPrivateLinksChecked(userID int64, rec *store.FileRecord, strea
 
 // botIsAdminIn reports whether the bot is an admin in the chat. Uses the
 // cached bot user ID (no GetMe call).
-func (b *Bot) botIsAdminIn(m *telegram.NewMessage) bool {
-	if m == nil || b.primary == nil || b.botUserID == 0 {
+func (b *Bot) botIsAdminIn(ctx context.Context, chatID int64) bool {
+	if b.Backend == nil || b.botUserID == 0 {
 		return false
 	}
-	member, err := b.primary.GetChatMember(m.ChatID(), b.botUserID)
+	status, err := b.Backend.GetChatMemberStatus(ctx, chatID, b.botUserID)
 	if err != nil {
-		b.Log.Debug("botIsAdminIn: GetChatMember failed", "chat_id", m.ChatID(), "error", err)
+		b.Log.Debug("botIsAdminIn: GetChatMemberStatus failed", "chat_id", chatID, "error", err)
 		return false
 	}
-	if member == nil {
-		return false
-	}
-	return member.Status == "admin" || member.Status == "creator"
+	return status == "administrator" || status == "creator"
 }
 
 // userStartedPrompt is shown when a /link user hasn't started the bot in
 // private chat yet. Uses the cached bot username.
-func (b *Bot) userStartedPrompt(m *telegram.NewMessage) {
-	botUsername := b.botUsername
-	opts := &telegram.SendOptions{ParseMode: "HTML"}
-	if botUsername != "" {
-		opts.ReplyMarkup = telegram.InlineURL(theme.Start+" Start", "https://t.me/"+botUsername+"?start=link")
+func (b *Bot) userStartedPrompt(ctx context.Context, m tgutil.IncomingMsg) {
+	var markup any
+	if b.botUsername != "" {
+		markup = tgutil.NewKeyboard().AddRow(tgutil.InlineURL(theme.Start+" Start", "https://t.me/"+b.botUsername+"?start=link")).Build()
 	}
-	_, _ = m.Respond(msgUsageLinkPrivate, opts)
+	_ = b.Backend.SendHTML(ctx, m.ChatID, msgUsageLinkPrivate, markup, 0)
 }
 
-func (b *Bot) editStatusSafe(status *telegram.NewMessage, text string) (*telegram.NewMessage, error) {
-	if status == nil {
-		return nil, nil
+// senderName resolves a trimmed "First Last" display name for vault-log
+// provenance. Best-effort: returns "" on lookup failure (PostVaultLog then
+// falls back to "User <id>", like an empty sender name did before).
+func (b *Bot) senderName(ctx context.Context, userID int64) string {
+	if userID == 0 {
+		return ""
 	}
-	primary := b.Pool.Primary()
-	if primary == nil {
-		b.Log.Warn("editStatusSafe: no primary client")
-		return nil, nil
-	}
-	return primary.EditMessage(status.ChatID(), status.ID, text, &telegram.SendOptions{ParseMode: "HTML"})
-}
-
-func (b *Bot) editStatusWithButtons(status *telegram.NewMessage, text, streamURL, downloadURL string) {
-	if status == nil {
-		return
-	}
-	kb := telegram.NewKeyboard().
-		AddRow(
-			telegram.Button.URL(theme.Stream+" Stream", streamURL),
-			telegram.Button.URL(theme.Download+" Download", downloadURL),
-		).
-		Build()
-	_, err := b.Pool.Primary().EditMessage(status.ChatID(), status.ID, text, &telegram.SendOptions{
-		ParseMode:   "HTML",
-		ReplyMarkup: kb,
-	})
+	u, err := b.Backend.GetUser(ctx, userID)
 	if err != nil {
-		b.Log.Debug("editStatusWithButtons failed", "error", err)
-		// Fallback: edit without buttons.
-		_, _ = b.editStatusSafe(status, text)
-	}
-}
-
-func userName(u *telegram.UserObj) string {
-	if u == nil {
 		return ""
 	}
 	return strings.TrimSpace(u.FirstName + " " + u.LastName)
 }
 
-func chatTitle(m *telegram.NewMessage) string {
-	if m == nil {
-		return ""
+func (b *Bot) editStatusSafe(ctx context.Context, status Sent, text string) error {
+	if status.ID == 0 {
+		return nil
 	}
-	if m.Channel != nil {
-		return m.Channel.Title
+	return b.Backend.EditHTML(ctx, status.ChatID, status.ID, text, nil)
+}
+
+func (b *Bot) editStatusWithButtons(ctx context.Context, status Sent, text, streamURL, downloadURL string) {
+	if status.ID == 0 {
+		return
 	}
-	if m.Chat != nil {
-		return m.Chat.Title
+	kb := tgutil.NewKeyboard().
+		AddRow(
+			tgutil.InlineURL(theme.Stream+" Stream", streamURL),
+			tgutil.InlineURL(theme.Download+" Download", downloadURL),
+		).
+		Build()
+	err := b.Backend.EditHTML(ctx, status.ChatID, status.ID, text, kb)
+	if err != nil {
+		b.Log.Debug("editStatusWithButtons failed", "error", err)
+		// Fallback: edit without buttons.
+		_ = b.editStatusSafe(ctx, status, text)
 	}
-	return ""
 }

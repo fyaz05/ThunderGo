@@ -18,10 +18,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/amarnathcjd/gogram/telegram"
-
 	tghttp "github.com/fyaz05/ThunderGo/internal/http"
 	"github.com/fyaz05/ThunderGo/internal/store"
+	"github.com/fyaz05/ThunderGo/internal/tgutil"
 )
 
 // handleBan /ban <user_id> [reason]. Bans a user or, if the ID is negative,
@@ -37,7 +36,7 @@ func (b *Bot) handleBan(c *Context) error {
 		_, _ = c.ReplyFormatted(msgErrInvalidIDInt)
 		return nil
 	}
-	if id == c.Msg.SenderID() {
+	if id == c.Msg.SenderID {
 		_, _ = c.ReplyFormatted(msgBannedSelf)
 		return nil
 	}
@@ -56,9 +55,9 @@ func (b *Bot) handleBan(c *Context) error {
 			_, _ = c.ReplyFormatted(msgBannedInvalidChannel)
 			return nil
 		}
-		if err := b.Store.BanChannel(dbCtx, store.BannedChannel{
+		if err := b.st().BanChannel(dbCtx, store.BannedChannel{
 			ChannelID: id,
-			BannedBy:  c.Msg.SenderID(),
+			BannedBy:  c.Msg.SenderID,
 			BannedAt:  now,
 			Reason:    reason,
 		}); err != nil {
@@ -66,11 +65,7 @@ func (b *Bot) handleBan(c *Context) error {
 			return nil
 		}
 		// Best-effort: leave the channel.
-		if primary := b.Pool.Primary(); primary != nil {
-			_ = primary.LeaveChannel(id)
-		} else {
-			b.Log.Warn("ban: no primary client to leave channel")
-		}
+		_ = b.Backend.LeaveChat(b.baseCtx, id)
 		reasonSuffix := ""
 		if reason != "" {
 			reasonSuffix = fmt.Sprintf(msgBannedReasonSuffix, html.EscapeString(reason))
@@ -79,9 +74,9 @@ func (b *Bot) handleBan(c *Context) error {
 		return nil
 	}
 
-	if err := b.Store.BanUser(dbCtx, store.BannedUser{
+	if err := b.st().BanUser(dbCtx, store.BannedUser{
 		UserID:   id,
-		BannedBy: c.Msg.SenderID(),
+		BannedBy: c.Msg.SenderID,
 		BannedAt: now,
 		Reason:   reason,
 	}); err != nil {
@@ -93,10 +88,8 @@ func (b *Bot) handleBan(c *Context) error {
 	if reason != "" {
 		notice = fmt.Sprintf(msgBannedNoticeReason, html.EscapeString(reason))
 	}
-	if primary := b.Pool.Primary(); primary != nil {
-		_, _ = primary.SendMessage(id, notice, &telegram.SendOptions{ParseMode: "HTML"})
-	} else {
-		b.Log.Warn("ban: no primary client to notify user")
+	if err := b.Backend.SendHTML(b.baseCtx, id, notice, nil, 0); err != nil {
+		b.Log.Debug("ban: could not notify banned user", "user_id", id, "error", err)
 	}
 	reasonSuffix := ""
 	if reason != "" {
@@ -121,21 +114,19 @@ func (b *Bot) handleUnban(c *Context) error {
 	dbCtx, dbCancel := context.WithTimeout(b.baseCtx, 30*time.Second)
 	defer dbCancel()
 	if id < 0 {
-		if err := b.Store.UnbanChannel(dbCtx, id); err != nil {
+		if err := b.st().UnbanChannel(dbCtx, id); err != nil {
 			_, _ = c.ReplyFormatted(fmt.Sprintf(msgErrDBOperation, html.EscapeString(err.Error())))
 			return nil
 		}
 		_, _ = c.ReplyFormatted(fmt.Sprintf(msgUnbannedChannel, id))
 		return nil
 	}
-	if err := b.Store.UnbanUser(dbCtx, id); err != nil {
+	if err := b.st().UnbanUser(dbCtx, id); err != nil {
 		_, _ = c.ReplyFormatted(fmt.Sprintf(msgErrDBOperation, html.EscapeString(err.Error())))
 		return nil
 	}
-	if primary := b.Pool.Primary(); primary != nil {
-		_, _ = primary.SendMessage(id, msgUnbannedNotice, &telegram.SendOptions{ParseMode: "HTML"})
-	} else {
-		b.Log.Warn("unban: no primary client to notify user")
+	if err := b.Backend.SendHTML(b.baseCtx, id, msgUnbannedNotice, nil, 0); err != nil {
+		b.Log.Debug("unban: could not notify user", "user_id", id, "error", err)
 	}
 	_, _ = c.ReplyFormatted(fmt.Sprintf(msgUnbannedUser, id))
 	return nil
@@ -144,12 +135,12 @@ func (b *Bot) handleUnban(c *Context) error {
 // handleBroadcast /broadcast (reply to a message). Modes: all/authorized/regular;
 // retries transient errors 3×, prunes unreachable users in the background.
 func (b *Bot) handleBroadcast(c *Context) error {
-	if !c.Msg.IsReply() {
+	if c.Msg.ReplyToMsgID == 0 {
 		_, _ = c.ReplyFormatted(msgBroadcastUsage)
 		return nil
 	}
-	reply, err := c.Msg.GetReplyMessage()
-	if err != nil || reply == nil {
+	reply, err := b.Backend.GetReplyMessage(c.Ctx, c.Msg.ChatID, c.Msg.MsgID)
+	if err != nil {
 		_, _ = c.ReplyFormatted(msgErrFetchMsg)
 		return nil
 	}
@@ -165,14 +156,11 @@ func (b *Bot) handleBroadcast(c *Context) error {
 
 	// Authorized-mode: check IsAuthorized per-user during streaming, not in bulk.
 
-	kb := telegram.NewKeyboard().
-		AddRow(telegram.Button.Data(theme.Cancel+" Cancel", "broadcast_cancel")).
+	kb := tgutil.NewKeyboard().
+		AddRow(tgutil.InlineCallback(theme.Cancel+" Cancel", "broadcast_cancel")).
 		Build()
-	status, _ := c.Msg.Reply(msgBroadcastStart, &telegram.SendOptions{
-		ParseMode:   "HTML",
-		ReplyMarkup: kb,
-	})
-	if status == nil {
+	status, err := c.ReplyMarkup(msgBroadcastStart, kb)
+	if err != nil || status.ID == 0 {
 		_, _ = c.ReplyFormatted(msgErrPostStatus)
 		return nil
 	}
@@ -210,9 +198,9 @@ func (b *Bot) handleBroadcast(c *Context) error {
 				b.Log.Error("panic in broadcast producer", "recover", r)
 			}
 		}()
-		streamErr := b.Store.StreamUsers(listCtx, func(u store.User) error {
+		streamErr := b.st().StreamUsers(listCtx, func(u store.User) error {
 			if mode == "authorized" || mode == "regular" {
-				auth, authErr := b.Store.IsAuthorized(listCtx, u.UserID)
+				auth, authErr := b.st().IsAuthorized(listCtx, u.UserID)
 				if authErr != nil {
 					b.Log.Debug("broadcast: IsAuthorized check failed", "user_id", u.UserID, "error", authErr)
 				}
@@ -249,9 +237,8 @@ func (b *Bot) handleBroadcast(c *Context) error {
 					b.Log.Error("panic in broadcast worker", "recover", r, "stack", string(debugStack()))
 				}
 			}()
-			primary := b.Pool.Primary()
-			if primary == nil {
-				b.Log.Warn("broadcast worker: no primary client")
+			if b.Backend == nil {
+				b.Log.Warn("broadcast worker: no backend")
 				return
 			}
 			for u := range userCh {
@@ -259,6 +246,8 @@ func (b *Bot) handleBroadcast(c *Context) error {
 					return
 				}
 				// Retry transient errors 3× with exponential backoff.
+				// Permanent per-user failures (blocked/deactivated/
+				// unreachable) and FLOOD_WAIT are not retried.
 				var sendErr error
 				var unreachable bool
 				for attempt := 0; attempt < 3; attempt++ {
@@ -269,19 +258,17 @@ func (b *Bot) handleBroadcast(c *Context) error {
 							return
 						}
 					}
-					_, sendErr = primary.Forward(u.UserID, reply.ChatID(), []int32{reply.ID}, &telegram.ForwardOptions{HideAuthor: true})
+					_, sendErr = b.Backend.ForwardMessages(broadcastCtx, u.UserID, reply.ChatID, []int{reply.MsgID}, true)
 					if sendErr == nil {
 						break // success
 					}
-					if telegram.MatchError(sendErr, "USER_IS_BLOCKED") ||
-						telegram.MatchError(sendErr, "PEER_ID_INVALID") ||
-						telegram.MatchError(sendErr, "USER_DEACTIVATED") ||
-						telegram.MatchError(sendErr, "CHAT_WRITE_FORBIDDEN") {
+					if broadcastUnreachable(sendErr) {
 						unreachable = true
 						break
 					}
-					// FLOOD_WAIT: pool's FloodHandler already gave up — don't retry.
-					if telegram.MatchError(sendErr, "FLOOD_WAIT") {
+					// FLOOD_WAIT: never retried — the wait is owed to
+					// Telegram, and sleeping here would stall the worker.
+					if _, isFlood := tgutil.MapFloodWait(sendErr); isFlood {
 						break
 					}
 				}
@@ -327,7 +314,7 @@ func (b *Bot) handleBroadcast(c *Context) error {
 			pruneCtx, pruneCancel := context.WithTimeout(b.baseCtx, 60*time.Second)
 			defer pruneCancel()
 			for _, uid := range uids {
-				if err := b.Store.DeleteUser(pruneCtx, uid); err != nil {
+				if err := b.st().DeleteUser(pruneCtx, uid); err != nil {
 					b.Log.Debug("could not prune unreachable user", "user_id", uid, "error", err)
 				}
 			}
@@ -351,17 +338,11 @@ func (b *Bot) handleBroadcast(c *Context) error {
 	} else {
 		summary = fmt.Sprintf(msgBroadcastComplete, elapsed, modeLabel, total, succeeded, failed, unreachable)
 	}
-	if primary := b.Pool.Primary(); primary != nil {
-		_, editErr := primary.EditMessage(status.ChatID(), status.ID, summary, &telegram.SendOptions{
-			ParseMode: "HTML",
-			// nil clears the Cancel button; empty keyboard triggers REPLY_MARKUP_INVALID.
-		})
-		if editErr != nil {
-			b.Log.Warn("broadcast: could not edit status to summary; sending as new message", "error", editErr)
-			_, _ = c.Msg.Respond(summary, &telegram.SendOptions{ParseMode: "HTML"})
-		}
-	} else {
-		b.Log.Warn("broadcast summary: no primary client")
+	// nil markup clears the Cancel button; an empty keyboard triggers
+	// REPLY_MARKUP_INVALID.
+	if err := b.Backend.EditHTML(b.baseCtx, status.ChatID, status.ID, summary, nil); err != nil {
+		b.Log.Warn("broadcast: could not edit status to summary; sending as new message", "error", err)
+		_, _ = c.Respond(summary)
 	}
 	return nil
 }
@@ -379,23 +360,18 @@ func (b *Bot) handleAuthorize(c *Context) error {
 		_, _ = c.ReplyFormatted(msgErrInvalidID)
 		return nil
 	}
-	primary := b.Pool.Primary()
-	if primary == nil {
-		_, _ = c.ReplyFormatted(msgErrBotNotReady)
-		return nil
-	}
-	u, err := primary.GetUser(id)
-	if err != nil || u == nil {
+	u, err := b.Backend.GetUser(c.Ctx, id)
+	if err != nil || u.ID == 0 {
 		_, _ = c.ReplyFormatted(msgAuthUserNotFound)
 		return nil
 	}
 	firstName := u.FirstName
 	authCtx, authCancel := context.WithTimeout(b.baseCtx, 30*time.Second)
 	defer authCancel()
-	if err := b.Store.Authorize(authCtx, store.AuthorizedUser{
+	if err := b.st().Authorize(authCtx, store.AuthorizedUser{
 		UserID:    id,
 		FirstName: firstName,
-		AddedBy:   c.Msg.SenderID(),
+		AddedBy:   c.Msg.SenderID,
 		AddedAt:   time.Now(),
 	}); err != nil {
 		_, _ = c.ReplyFormatted(fmt.Sprintf(msgErrDBOperation, html.EscapeString(err.Error())))
@@ -422,13 +398,13 @@ func (b *Bot) handleDeauthorize(c *Context) error {
 	}
 	dctx, dcancel := context.WithTimeout(b.baseCtx, 30*time.Second)
 	defer dcancel()
-	if err := b.Store.Deauthorize(dctx, id); err != nil {
+	if err := b.st().Deauthorize(dctx, id); err != nil {
 		_, _ = c.ReplyFormatted(fmt.Sprintf(msgErrDBOperation, html.EscapeString(err.Error())))
 		return nil
 	}
 	// Best-effort: revoke active token-activation so deauthorized users can't keep using the bot.
 	if b.Cfg.TokenEnabled {
-		if err := b.Store.InvalidateActivatedUser(dctx, id); err != nil {
+		if err := b.st().InvalidateActivatedUser(dctx, id); err != nil {
 			b.Log.Debug("could not invalidate activated user", "user_id", id, "error", err)
 		}
 	}
@@ -440,7 +416,7 @@ func (b *Bot) handleDeauthorize(c *Context) error {
 func (b *Bot) handleListAuth(c *Context) error {
 	laCtx, laCancel := context.WithTimeout(b.baseCtx, 30*time.Second)
 	defer laCancel()
-	auths, err := b.Store.ListAuthorized(laCtx)
+	auths, err := b.st().ListAuthorized(laCtx)
 	if err != nil {
 		_, _ = c.ReplyFormatted(fmt.Sprintf(msgErrDBOperation, html.EscapeString(err.Error())))
 		return nil
@@ -485,8 +461,7 @@ func (b *Bot) handleListAuth(c *Context) error {
 		if total > 1 {
 			header += fmt.Sprintf("\n\n<blockquote>📄 <b>Page %d of %d</b> — %d user(s)</blockquote>", i+1, total, len(auths))
 		}
-		opts := &telegram.SendOptions{ParseMode: "HTML", ReplyMarkup: buildCloseMarkup()}
-		_, _ = c.Msg.Respond(header+"\n\n"+pageBody, opts)
+		_, _ = c.RespondMarkup(header+"\n\n"+pageBody, buildCloseMarkup())
 		if i < total-1 {
 			time.Sleep(1 * time.Second)
 		}
@@ -499,13 +474,13 @@ func (b *Bot) handleListAuth(c *Context) error {
 func (b *Bot) handleStatus(c *Context) error {
 	uptime := formatReadableDuration(time.Since(b.startTime))
 	botUsername := b.botUsername
-	all := b.Pool.All()
 	perClient := b.Pool.PerClientInflight()
+	perDC := b.Pool.PerClientDC()
 	var workload strings.Builder
 	for i, n := range perClient {
 		dc := 0
-		if i < len(all) && all[i] != nil {
-			dc = all[i].GetDC()
+		if i < len(perDC) {
+			dc = perDC[i]
 		}
 		workload.WriteString(fmt.Sprintf("🤖 <code>bot_%02d</code> — ⚡ inflight <b>%d</b>, 🌍 DC <code>%d</code>\n", i, n, dc))
 	}
@@ -516,8 +491,7 @@ func (b *Bot) handleStatus(c *Context) error {
 		b.Pool.Len(),
 		b.Pool.TotalInflight(),
 		workload.String())
-	opts := &telegram.SendOptions{ParseMode: "HTML", ReplyMarkup: buildCloseMarkup()}
-	_, _ = c.Msg.Respond(text, opts)
+	_, _ = c.RespondMarkup(text, buildCloseMarkup())
 	return nil
 }
 
@@ -525,13 +499,12 @@ func (b *Bot) handleStatus(c *Context) error {
 func (b *Bot) handleUsers(c *Context) error {
 	ucCtx, ucCancel := context.WithTimeout(b.baseCtx, 30*time.Second)
 	defer ucCancel()
-	count, err := b.Store.CountUsers(ucCtx)
+	count, err := b.st().CountUsers(ucCtx)
 	if err != nil {
 		_, _ = c.ReplyFormatted(fmt.Sprintf(msgErrDBOperation, html.EscapeString(err.Error())))
 		return nil
 	}
-	opts := &telegram.SendOptions{ParseMode: "HTML", ReplyMarkup: buildCloseMarkup()}
-	_, _ = c.Msg.Respond(fmt.Sprintf(msgUserCount, count), opts)
+	_, _ = c.RespondMarkup(fmt.Sprintf(msgUserCount, count), buildCloseMarkup())
 	return nil
 }
 
@@ -606,18 +579,7 @@ func (b *Bot) handleLog(c *Context) error {
 		b.Log.Warn("sync log temp file failed", "error", err)
 	}
 
-	primary := b.Pool.Primary()
-	if primary == nil {
-		b.Log.Warn("log: no primary client to send file")
-		_, _ = c.ReplyFormatted(msgLogSendErr)
-		return nil
-	}
-	_, err = primary.SendMedia(c.Msg.ChatID(), tmp.Name(), &telegram.MediaOptions{
-		Caption:       caption,
-		ParseMode:     "HTML",
-		ForceDocument: true,
-	})
-	if err != nil {
+	if err := b.Backend.SendFileDocument(c.Ctx, c.Msg.ChatID, tmp.Name(), caption, true); err != nil {
 		b.Log.Warn("sending log file failed", "error", err)
 		_, _ = c.ReplyFormatted(msgLogSendErr)
 	}
@@ -643,21 +605,21 @@ func redactLogSecrets(in []byte) []byte {
 // then signals self (SIGTERM) for supervisor restart. On failure, edits the
 // status message with the error; on next startup, marker → "Restart Successful".
 func (b *Bot) handleRestart(c *Context) error {
-	status, _ := c.Reply(msgRestarting)
-	if status == nil {
+	status, err := c.Reply(msgRestarting)
+	if err != nil || status.ID == 0 {
 		_, _ = c.ReplyFormatted(msgErrPostStatus)
 		return nil
 	}
 
 	marker := store.RestartMarker{
 		ID:        fmt.Sprintf("restart-%d", time.Now().UnixNano()),
-		ChatID:    status.ChatID(),
-		MessageID: status.ID,
+		ChatID:    status.ChatID,
+		MessageID: int32(status.ID), //nosec G115 // message IDs fit int32
 		CreatedAt: time.Now(),
 	}
 	rmCtx, rmCancel := context.WithTimeout(b.baseCtx, 30*time.Second)
 	defer rmCancel()
-	if err := b.Store.SaveRestartMarker(rmCtx, marker); err != nil {
+	if err := b.st().SaveRestartMarker(rmCtx, marker); err != nil {
 		b.Log.Warn("saving restart marker", "error", err)
 	}
 
@@ -762,16 +724,13 @@ func (b *Bot) handleRestart(c *Context) error {
 
 // editRestartError edits the restart status message with an error and aborts
 // the restart (does NOT signal self). Used when git pull or go build fails.
-func (b *Bot) editRestartError(status *telegram.NewMessage, msg string) {
-	if status == nil {
+func (b *Bot) editRestartError(status Sent, msg string) {
+	if status.ID == 0 {
 		return
 	}
 	b.Log.Error("restart aborted", "error", msg)
-	if primary := b.Pool.Primary(); primary != nil {
-		_, _ = primary.EditMessage(status.ChatID(), status.ID,
-			fmt.Sprintf(msgRestartFailed, html.EscapeString(msg)),
-			&telegram.SendOptions{ParseMode: "HTML"})
-	} else {
-		b.Log.Warn("editRestartError: no primary client")
+	if err := b.Backend.EditHTML(b.baseCtx, status.ChatID, status.ID,
+		fmt.Sprintf(msgRestartFailed, html.EscapeString(msg)), nil); err != nil {
+		b.Log.Warn("editRestartError: could not edit status", "error", err)
 	}
 }
