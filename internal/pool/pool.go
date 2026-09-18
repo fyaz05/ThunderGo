@@ -127,6 +127,11 @@ func (l *Lease) AcquireLookup(ctx context.Context) (release func(), ok bool) {
 	if l == nil || l.slot == nil || l.slot.lookupSem == nil {
 		return func() {}, true
 	}
+	// Fast-path: an already-cancelled context must never take a semaphore
+	// token (select is unbiased when both sides are ready).
+	if err := ctx.Err(); err != nil {
+		return func() {}, false
+	}
 	select {
 	case l.slot.lookupSem <- struct{}{}:
 		var once sync.Once

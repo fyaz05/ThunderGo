@@ -688,6 +688,13 @@ type pipeline struct {
 	// consumer returns one after emitting it.
 	freeSlots chan struct{}
 
+	// dispatchClosed flips true when the dispatcher goroutine exits (plan
+	// exhausted, aborted, or context cancelled); sent counts jobs handed to
+	// workers. Together they let next() prove whether a pending chunk can
+	// still arrive instead of waiting forever.
+	dispatchClosed bool
+	sent           int
+
 	mu       sync.Mutex
 	cond     *sync.Cond
 	slots    []chunkResult // len = bufferCount; workers write slots[i%len]
@@ -754,6 +761,12 @@ func (p *pipeline) start() {
 func (p *pipeline) dispatch() {
 	defer p.wg.Done()
 	defer close(p.jobs)
+	defer func() {
+		p.mu.Lock()
+		p.dispatchClosed = true
+		p.cond.Broadcast() // wake a consumer waiting on a chunk that will never come
+		p.mu.Unlock()
+	}()
 	for i := range p.plan {
 		if p.abortFlag.Load() {
 			return
@@ -765,6 +778,9 @@ func (p *pipeline) dispatch() {
 		}
 		select {
 		case p.jobs <- i:
+			p.mu.Lock()
+			p.sent = i + 1
+			p.mu.Unlock()
 		case <-p.ctx.Done():
 			return
 		}
@@ -812,6 +828,13 @@ func (p *pipeline) next() (chunkResult, bool) {
 		if p.ctx.Err() != nil {
 			p.mu.Unlock()
 			return chunkResult{err: p.ctx.Err()}, true
+		}
+		if p.dispatchClosed && p.sent <= p.nextEmit {
+			// The dispatcher is gone and every chunk it handed out has been
+			// emitted: nothing can fill this slot. Terminate the stream
+			// instead of hanging (found by the cancel-storm test).
+			p.mu.Unlock()
+			return chunkResult{err: errors.New("stream: chunk dispatcher ended before plan completion")}, true
 		}
 		p.cond.Wait()
 	}
