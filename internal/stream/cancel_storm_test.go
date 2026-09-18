@@ -33,8 +33,13 @@ func TestSlotAccountingUnderCancelStorms(t *testing.T) {
 		t.Helper()
 		ft := tgutil.NewFakeTransport()
 		ft.DefaultHandle = testHandle()
+		// Every slot in the fleet must carry a valid DefaultHandle: a bare
+		// NewFakeTransport resolves a zero FileHandle, which the handler
+		// correctly reads as stale media and self-heals (deletes the record).
+		ft2 := tgutil.NewFakeTransport()
+		ft2.DefaultHandle = testHandle()
 		h := &Handler{
-			Pool:        pool.NewForTests(ft, tgutil.NewFakeTransport()), // 2 slots
+			Pool:        pool.NewForTests(ft, ft2), // 2 slots
 			Store:       &fakeStore{rec: testRecorder()},
 			Log:         quietStreamLogger(),
 			Ingester:    &ingest.Ingester{},

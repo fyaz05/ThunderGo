@@ -374,6 +374,13 @@ func (h *Handler) serveResolveError(w http.ResponseWriter, r *http.Request, toke
 		return
 	}
 	if tgutil.Classify(err) == tgutil.ErrClassPermanent {
+		// Re-check before self-healing: a request that died mid-resolve
+		// must never delete a record on classification that raced the
+		// cancellation. The stale record will self-heal on the next live
+		// request that observes it.
+		if r.Context().Err() != nil {
+			return
+		}
 		h.Log.Warn("stale vault file record",
 			"token", tgutil.TokenHash(token),
 			"vault_msg_id", rec.VaultMsgID,
@@ -419,6 +426,11 @@ func (h *Handler) servePipelineError(w http.ResponseWriter, r *http.Request, tok
 		return
 	}
 	if tgutil.Classify(err) == tgutil.ErrClassPermanent {
+		// Same TOCTOU guard as serveResolveError: never self-heal off a
+		// request whose context died mid-flight.
+		if r.Context().Err() != nil {
+			return
+		}
 		h.Log.Warn("vault media went stale during stream start",
 			"token", tgutil.TokenHash(token),
 			"vault_msg_id", rec.VaultMsgID,
@@ -514,6 +526,14 @@ func (h *Handler) resolveVaultMedia(ctx context.Context, lease *pool.Lease, rec 
 
 	select {
 	case got := <-ch:
+		// Cancellation raced with the result. A zero-Location handle
+		// returned while the lookup context is already dead is NOT proof
+		// of staleness — treating it as such would self-heal (delete) a
+		// perfectly good record off a dying request. Surface the ctx
+		// error instead; the mapper treats it as client-gone/other.
+		if lookupCtx.Err() != nil {
+			return tgutil.FileHandle{}, lookupCtx.Err()
+		}
 		if got.err != nil {
 			return tgutil.FileHandle{}, got.err
 		}
