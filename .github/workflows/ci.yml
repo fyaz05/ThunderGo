@@ -21,9 +21,12 @@ jobs:
           cache: true
       - name: gofmt check
         run: |
-          if [ -n "$(gofmt -l .)" ]; then
+          # vendor/ is excluded: vendored third-party code is not formatted
+          # by our gofmt version by definition.
+          UNFORMATTED="$(gofmt -l . | grep -v '^vendor/' || true)"
+          if [ -n "$UNFORMATTED" ]; then
             echo "::error::gofmt found unformatted files:"
-            gofmt -l .
+            echo "$UNFORMATTED"
             exit 1
           fi
       - name: go vet

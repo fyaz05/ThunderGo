@@ -66,7 +66,7 @@ Token properties: 128 bits of `crypto/rand`, Crockford base32 (26 chars), 10-min
 - **No per-IP rate limiting on `/f/...`** — hash entropy is the defense. Pool cap (`TG_MAX_CONCURRENT_PER_CLIENT`) bounds per-client concurrency.
 - **No HSTS / CSP / X-Frame-Options on `/f/...`** — TLS is expected to be terminated by an upstream reverse proxy (Caddy/Nginx), which is the correct place for HSTS. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 - **Vault channel messages are NOT deleted when a file auto-expires** (`TG_FILE_TTL_DAYS`) — only the DB record is removed.
-- **Bot session files are NOT encrypted at rest** — gogram limitation. Filesystem-level protection is the operator's responsibility.
+- **Bot sessions are stored via the mtgo session stack** — MongoDB adapter by default (collections managed by `mtgo-labs/storage`), or the pure-Go SQLite adapter with files chmod `0600` when operating file-based. Sessions are NOT encrypted at rest; filesystem/database-level protection is the operator's responsibility. Pre-revival gogram `*.session` files are not migrated — bots re-login transparently from their tokens on first boot.
 
 ## What IS Protected
 

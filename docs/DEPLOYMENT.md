@@ -308,3 +308,21 @@ ls -l /tmp/head.bin   # expected: 100 bytes
 | Bot doesn't respond to commands | Check bot username, `TG_OWNER_USER_ID`, and BotFather's `/setprivacy` setting (must be DISABLED or the bot must be a group admin for `/link` to work in groups) |
 | Bot can't send DMs | Users must `/start` the bot in private chat first (Telegram bots can't initiate DMs) |
 | Container keeps restarting | Check `docker compose logs thundergo` — the config validator surfaces the specific field that failed |
+
+---
+
+## Sessions (mtgo re-platform)
+
+Bot sessions live in the **MongoDB adapter** of `mtgo-labs/storage` (database `thundergo`, collections created and indexed by the adapter) when `TG_MONGO_URI` is set — one session per bot keyed by `bot-00`, `bot-01`, … For file-based operation, the SQLite adapter writes chmod-`0600` files. Pre-revival gogram `*.session` files are **not migrated**: bots re-login from their tokens automatically on first boot (no user action needed).
+
+## Capacity planning
+
+Peak Telegram RPCs ≈ `streams × CONCURRENCY` across the fleet. `STREAM_PROFILE` presets (`basic` 4/8/30s/3, `medium` 6/12/45s/3, `high` 8/16/60s/5) tune `CONCURRENCY`/`BUFFER_COUNT`/`TIMEOUT_SEC`/`MAX_RETRIES` — see [CONFIGURATION.md](CONFIGURATION.md). Watch for `FLOOD_WAIT` in logs before raising concurrency; add extra bots (`TG_EXTRA_BOTS1..50`, all admins of the vault channel) before adding concurrency.
+
+## Validation before promotion (Phase 5 gauntlet)
+
+Run the staging gauntlet on **production data centers only** (throttling and slow-DC behavior do not reproduce on test DCs). The full checklist — tc-throttled links, 100-way cancel storms, FloodWait injection, primary-kill failover, 99%-completion byte counts, 24h leak watch, p50/p99 TTFB — lives in [VALIDATION.md](VALIDATION.md).
+
+## Canary cutover (Phase 6)
+
+Shadow 5% → 25% → 100% with `sha256` byte-compare sampling of both paths per sampled request; hold 72h clean at 100% before decommissioning the previous service. Rollback target: the frozen `pre-revival-freeze` branch.

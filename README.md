@@ -264,7 +264,7 @@ Copy `.env.example` to `.env` and fill in the **7 required fields**. All options
 
 ## Tech Stack
 
-**Go 1.26** · [gogram](https://github.com/amarnathcjd/gogram) · [MongoDB](https://www.mongodb.com/) · [chi](https://github.com/go-chi/chi) · [caarlos0/env](https://github.com/caarlos0/env) · `go:embed` · **9 direct deps** · **No CGO** · **~31 MB binary**
+**Go 1.26** · [mtgo](https://github.com/mtgo-labs/mtgo) v0.21.0 (native MTProto 2.0) · [MongoDB](https://www.mongodb.com/) · [chi](https://github.com/go-chi/chi) · [caarlos0/env](https://github.com/caarlos0/env) · `go:embed` · **No CGO**
 
 ---
 

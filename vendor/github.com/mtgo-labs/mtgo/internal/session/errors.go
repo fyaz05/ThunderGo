@@ -1,0 +1,165 @@
+package session
+
+import (
+	"errors"
+	"fmt"
+	"io"
+)
+
+// Session connection and authentication errors.
+//
+// These errors are returned during MTProto session establishment (key
+// exchange, transport setup, and the DH handshake).
+var (
+	// ErrAuthKeyNotSet is returned when an operation requires an
+	// authorization key but none has been generated or loaded yet.
+	ErrAuthKeyNotSet = errors.New("session: auth key not set")
+	// ErrTransportNotSet is returned when an operation requires a transport
+	// (TCP, WebSocket, etc.) but none has been configured.
+	ErrTransportNotSet = errors.New("session: transport not set")
+	// ErrSendTimeout is returned when sending a message to the server
+	// exceeds the configured write deadline.
+	ErrSendTimeout = errors.New("session: send timeout")
+	// ErrSessionClosed is returned when the session has been stopped and
+	// pending operations are cancelled.
+	ErrSessionClosed = errors.New("session: closed")
+	// ErrConnectNoAuthKey is returned when Connect is called before an
+	// authorization key has been generated via key generation.
+	ErrConnectNoAuthKey = errors.New("session: connect: no auth key")
+	// ErrDraining is returned when a write is attempted while the session
+	// is draining pending work before shutdown.
+	ErrDraining = errors.New("session: draining")
+	// ErrNotConnected is returned when a write or connect is attempted
+	// while the session is not in an active state.
+	ErrNotConnected = errors.New("session: not connected")
+
+	// ErrSHA1Mismatch is returned during the DH key exchange when the SHA1
+	// hash of the received data does not match the expected value.
+	ErrSHA1Mismatch = errors.New("session: sha1 hash mismatch")
+	// ErrNonceMismatch is returned during key exchange step 3 when the
+	// server's response nonce does not match the nonce sent by the client.
+	ErrNonceMismatch = errors.New("step 3: nonce mismatch")
+	// ErrDHParamsFail is returned during key exchange step 8 when the server
+	// responds with a DH parameter failure.
+	ErrDHParamsFail = errors.New("step 8: server dh params fail")
+	// ErrDHNonceMismatch is returned during key exchange step 8 when the
+	// nonce in the DH inner data does not match the expected value.
+	ErrDHNonceMismatch = errors.New("step 8: nonce mismatch in dh inner data")
+	// ErrNewNonceHashMismatch is returned during key exchange when a
+	// new_nonce_hash value does not match the expected hash.
+	ErrNewNonceHashMismatch = errors.New("session: new_nonce_hash mismatch")
+	// ErrDHGenRetry is returned during key exchange step 10 when the server
+	// responds with dh_gen_retry, indicating the client should retry with a
+	// new nonce.
+	ErrDHGenRetry = errors.New("step 10: dh_gen_retry")
+	// ErrDHGenFail is returned during key exchange step 10 when the server
+	// responds with dh_gen_fail, indicating the DH key generation failed.
+	ErrDHGenFail = errors.New("step 10: dh_gen_fail")
+
+	// ErrServerNonceMismatch is returned during the DH key exchange when
+	// the server_nonce in a server response does not match the original.
+	ErrServerNonceMismatch = errors.New("session: server_nonce mismatch")
+	// ErrDHPrimeInvalid is returned when the server's dh_prime fails
+	// validation (wrong bit length or not prime).
+	ErrDHPrimeInvalid = errors.New("session: dh_prime validation failed")
+	// ErrGAOutOfRange is returned when the server's g_a falls outside the
+	// required range [2, dh_prime-2].
+	ErrGAOutOfRange = errors.New("session: g_a out of range")
+	// ErrGBOutOfRange is returned when the client's computed g_b falls
+	// outside the required range [2, dh_prime-2].
+	ErrGBOutOfRange = errors.New("session: g_b out of range")
+
+	// ErrBusy is returned when the pending RPC count reaches MaxPendingRPC.
+	// No bytes are written to the transport when this error is returned.
+	ErrBusy = errors.New("session: too many pending RPCs")
+
+	// ErrWriteCircuitOpen is returned when the write circuit breaker has
+	// tripped due to consecutive write failures.
+	ErrWriteCircuitOpen = errors.New("session: write circuit breaker open")
+
+	// ErrMsgNotReceived indicates the server reported via msgs_state_info that
+	// a sent message was not received. The caller should retry.
+	ErrMsgNotReceived = errors.New("session: message not received by server")
+
+	// ErrRPCDropped indicates the pending RPC was dropped by the client via
+	// rpc_drop_answer. The original caller receives this error.
+	ErrRPCDropped = errors.New("session: rpc dropped by client")
+)
+
+// DeliveryState describes what is known about an RPC when its connection dies.
+type DeliveryState uint8
+
+const (
+	// DeliveryUnknown means bytes may have reached Telegram, but no ACK arrived.
+	DeliveryUnknown DeliveryState = iota
+	// DeliveryReceived means Telegram acknowledged the request before disconnect.
+	DeliveryReceived
+)
+
+func (s DeliveryState) String() string {
+	if s == DeliveryReceived {
+		return "received"
+	}
+	return "unknown"
+}
+
+// DeliveryError prevents callers from treating an uncertain write as a
+// definitely unsent request. Err retains the underlying transport/session error.
+type DeliveryError struct {
+	State DeliveryState
+	Err   error
+}
+
+func (e *DeliveryError) Error() string {
+	return fmt.Sprintf("session: RPC delivery %s: %v", e.State, e.Err)
+}
+
+func (e *DeliveryError) Unwrap() error { return e.Err }
+
+// ErrorClass classifies a transport or session error for reconnect decisions.
+type ErrorClass int
+
+const (
+	ClassTransient ErrorClass = iota
+	ClassPermanent
+	ClassClosed
+	ClassRateLimited
+	ClassMigrate
+	ClassUnknown
+)
+
+func (c ErrorClass) String() string {
+	switch c {
+	case ClassTransient:
+		return "transient"
+	case ClassPermanent:
+		return "permanent"
+	case ClassClosed:
+		return "closed"
+	case ClassRateLimited:
+		return "rate_limited"
+	case ClassMigrate:
+		return "migrate"
+	default:
+		return "unknown"
+	}
+}
+
+func ClassifyError(err error) ErrorClass {
+	if err == nil {
+		return ClassUnknown
+	}
+	if errors.Is(err, ErrSessionClosed) || errors.Is(err, ErrDraining) {
+		return ClassClosed
+	}
+	if errors.Is(err, ErrWriteCircuitOpen) {
+		return ClassPermanent
+	}
+	if errors.Is(err, io.EOF) {
+		return ClassClosed
+	}
+	if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
+		return ClassTransient
+	}
+	return ClassUnknown
+}

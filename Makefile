@@ -105,6 +105,7 @@ size: build
 
 tidy:
 	$(GO) mod tidy
+	$(GO) mod vendor
 
 clean:
 	rm -rf bin/ cover.out cover.html thundergo.log bot_*.session

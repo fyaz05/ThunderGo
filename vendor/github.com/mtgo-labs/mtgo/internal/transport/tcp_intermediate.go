@@ -1,0 +1,75 @@
+package transport
+
+import (
+	"bytes"
+	"encoding/binary"
+	"io"
+	"net"
+)
+
+// TCPIntermediate implements the MTProto "intermediate" transport which
+// prefixes each payload with a simple 4-byte little-endian length field.
+// It is simpler than full (no CRC) and more straightforward than abridged
+// (fixed-size length prefix).
+type TCPIntermediate struct {
+	conn    net.Conn
+	readBuf []byte
+}
+
+// NewTCPIntermediate returns a new TCPIntermediate transport wrapping conn.
+func NewTCPIntermediate(conn net.Conn) *TCPIntermediate {
+	return &TCPIntermediate{conn: conn}
+}
+
+// Connect sends the 0xEEEEEEEE protocol marker to the peer to negotiate the
+// intermediate transport mode.
+func (t *TCPIntermediate) Connect() error {
+	_, err := t.conn.Write([]byte{0xee, 0xee, 0xee, 0xee})
+	return err
+}
+
+// Conn returns the underlying net.Conn.
+func (t *TCPIntermediate) Conn() net.Conn { return t.conn }
+
+// send4ByteLengthPrefix writes buf to conn with a 4-byte little-endian length
+// prefix. Shared by TCPIntermediate and TCPIntermediateNoHeader.
+func send4ByteLengthPrefix(conn net.Conn, buf *bytes.Buffer) error {
+	data := buf.Bytes()
+	packet := make([]byte, 4+len(data))
+	binary.LittleEndian.PutUint32(packet[:4], uint32(len(data)))
+	copy(packet[4:], data)
+	_, err := conn.Write(packet)
+	return err
+}
+
+// Send writes buf to the connection with a 4-byte little-endian length prefix.
+func (t *TCPIntermediate) Send(buf *bytes.Buffer) error {
+	return send4ByteLengthPrefix(t.conn, buf)
+}
+
+// Recv reads the next intermediate-transport framed message from the
+// connection. It reads a 4-byte length prefix followed by the payload bytes.
+func (t *TCPIntermediate) Recv() ([]byte, error) {
+	var lenBytes [4]byte
+	if _, err := io.ReadFull(t.conn, lenBytes[:]); err != nil {
+		return nil, err
+	}
+
+	rawLen := binary.LittleEndian.Uint32(lenBytes[:])
+	if rawLen > uint32(MaxPayloadLen) {
+		return nil, ErrPayloadTooLarge
+	}
+	length := int(rawLen)
+	if length == 0 {
+		return nil, nil
+	}
+
+	if cap(t.readBuf) < length {
+		t.readBuf = make([]byte, length)
+	}
+	data := t.readBuf[:length]
+	if _, err := io.ReadFull(t.conn, data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}

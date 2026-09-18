@@ -1,9 +1,11 @@
 version: 2
 updates:
+  # Revival plan rule: mtgo is reviewed as a MONTHLY batch at most; the
+  # Phase-4 characterization suite is the merge gate for any bump.
   - package-ecosystem: gomod
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
       day: monday
     open-pull-requests-limit: 5
     labels: [dependencies, gomod]

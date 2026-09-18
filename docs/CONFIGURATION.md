@@ -23,6 +23,12 @@ Every ThunderGo environment variable. For deployment see [DEPLOYMENT.md](DEPLOYM
 | `TG_URL` | **yes** | — | Full public URL (scheme auto-detected) |
 | `TG_EXTRA_BOTS1`, `TG_EXTRA_BOTS2`, ... | no | (none) | Indexed extra bot tokens for concurrent independent downloads |
 | `TG_MAX_CONCURRENT_PER_CLIENT` | no | `8` | Max simultaneous downloads per bot client |
+| `STREAM_PROFILE` | no | `basic` | Stream tuning preset: `basic` / `medium` / `high` |
+| `CONCURRENCY` | no | preset | Parallel chunk fetches per request (overrides preset) |
+| `BUFFER_COUNT` | no | preset | Ordered window slots per request (overrides preset) |
+| `TIMEOUT_SEC` | no | preset | Per-chunk stall timeout in seconds (overrides preset) |
+| `MAX_RETRIES` | no | preset | Per-chunk retries (overrides preset) |
+| `ENABLE_LEGACY_LINKS` | no | `false` | Serve pre-revival URL shapes instead of answering 410 |
 | `TG_LOG_FILE` | no | (auto) | Log file path (see Storage & Logging) |
 | `TG_PRIVATE_MODE` | no | `false` | Restrict to owner + authorized users |
 | `TG_FORCE_SUB_CHANNEL_ID` | no | `0` | Require users to join a channel first |
@@ -142,7 +148,37 @@ Hard maximum simultaneous downloads per bot client. When every client reaches th
 TG_MAX_CONCURRENT_PER_CLIENT=8
 ```
 
+### Stream tuning: `STREAM_PROFILE`, `CONCURRENCY`, `BUFFER_COUNT`, `TIMEOUT_SEC`, `MAX_RETRIES`
 
+The download pipeline fetches Telegram file chunks with parallel workers and an ordered window. Tune it with a preset, then override individual knobs:
+
+| Preset | CONCURRENCY | BUFFER_COUNT | TIMEOUT_SEC | MAX_RETRIES |
+|---|---|---|---|---|
+| `basic` (default) | 4 | 8 | 30 | 3 |
+| `medium` | 6 | 12 | 45 | 3 |
+| `high` | 8 | 16 | 60 | 5 |
+
+Precedence: explicit env var > `STREAM_PROFILE` > `basic` defaults. Bounds: `CONCURRENCY` 1..64, `BUFFER_COUNT` 2..128, `TIMEOUT_SEC` 5..120, `MAX_RETRIES` 0..10 (out-of-range values clamp with a warning; unparseable values fail startup).
+
+**Retry/backoff:** each chunk retries up to `MAX_RETRIES` times with 100ms doubling backoff capped at 15s. `FLOOD_WAIT` answers surface as values: the pool marks that transport cooling down for the wait duration (capped at 10 minutes) and traffic shifts to healthy bots; if every bot is cooling, requests get `503` + a `Retry-After` estimate instead of queueing.
+
+**Capacity rule:** peak Telegram RPCs ≈ `streams × CONCURRENCY` across the fleet. Size `TG_MAX_CONCURRENT_PER_CLIENT` × bot count × `CONCURRENCY` against what your bots can absorb before FLOOD_WAITs dominate.
+
+```ini
+STREAM_PROFILE=medium
+# CONCURRENCY=6
+# BUFFER_COUNT=12
+# TIMEOUT_SEC=45
+# MAX_RETRIES=3
+```
+
+### `ENABLE_LEGACY_LINKS`
+
+Pre-revival link shapes — `/watch/f/{hash}/{name}`, `/watch/f/{hash}/{name}/raw`, `/watch/{hash}`, `/f/{hash}` — answer `410 Gone` with a constant body when this is `false` (default). Set `true` to keep serving them (old links keep working). The current shapes `/f/{hash}/{name}` (player) and `/f/{hash}/{name}/raw` (stream) are always live, as is `GET /` → repo redirect.
+
+```ini
+ENABLE_LEGACY_LINKS=false
+```
 
 ---
 

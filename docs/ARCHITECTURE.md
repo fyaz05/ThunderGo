@@ -172,3 +172,17 @@ On SIGINT/SIGTERM, `app.Run()` performs ordered graceful shutdown:
 6. `Store.Close(ctx)` — stop cache sweepers, disconnect Mongo
 
 Errors are aggregated via `errors.Join` so a failed subsystem is visible to the supervisor (Docker restart policy / systemd).
+
+---
+
+## Transport Seam (mtgo re-platform)
+
+All MTProto traffic flows through **`github.com/mtgo-labs/mtgo` v0.21.0** (native MTProto 2.0, Apache-2.0, pure Go). The library is imported by exactly **one source file** — `internal/tgutil/transport.go` — which defines the backend-agnostic surface every other package consumes:
+
+- **`Transport`** — the serving core: `Start/Stop`, `OnCommand/OnCallback`, `SendText`, `ResolveMedia`, `FetchChunk` (raw `tg.UploadGetFileRequest` with int64 offsets, 4 KiB-aligned limits ≤ 1 MiB, CDN redirect verify+decrypt), `RefreshFileRef`.
+- **`BotBackend`** — extends `Transport` with the operations the bot and ingester need (`SendHTML`, `EditHTML`, `ForwardMessages`, `GetMessagesBulk`, `ResolveChat`, …) using only tgutil-native types.
+- **Error taxonomy** — RPC failures classify into permanent (`ErrStaleMedia` → self-heal 404), transient (`ErrTransient` → 503), and flood (`FloodWait{Seconds}` → a **value**, never a sleep: the pool cools the transport and the HTTP layer answers 429/503 with `Retry-After`).
+
+The pool (`internal/pool`) owns the fleet: one transport per bot token (primary `bot-00` + indexed extras), least-loaded acquisition under a hard per-slot cap, and per-slot flood cooldowns swept every 5 minutes. Stream serving (`internal/stream`) leases a slot, resolves the vault media on it, and runs the adaptive windowed pipeline (tiers 64 KiB → 1 MiB, `CONCURRENCY`/`BUFFER_COUNT` knobs, per-chunk stall timeout, ≤ 3 file-ref refreshes per request, 25 ms cross-DC pacing).
+
+Swapping the backend again (e.g. to raw `gotd/td` if mtgo goes quiet) is a seam-only job: reimplement `transport.go` against the new library, keep `FakeTransport` honest in `transport_fake.go`, and the Phase-4 characterization suites are the merge gate.
