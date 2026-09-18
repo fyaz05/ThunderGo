@@ -1,22 +1,56 @@
 version: 2
+# Root-cause fix for dependabot branch floods (2026-09): the previous
+# default-branch config ran gomod WEEKLY with no grouping and a PR limit of
+# 5, so every single dependency bump became its own branch + PR against main
+# (7 branches piled up in one cycle).
+#
+# Three levers now keep the noise bounded:
+#   1. target-branch — every update PR lands on revival/mtgo-replatform, the
+#      active line of development, and branches FROM it (so bumps read its
+#      go.mod, not main's legacy one). main stays completely quiet.
+#      NOTE: once revival/mtgo-replatform merges into main, delete the three
+#      target-branch lines or dependabot will keep PRing against a dead branch.
+#   2. groups — gomod and github-actions minor+patch bumps collapse into ONE
+#      PR per ecosystem per cycle instead of one PR per dependency.
+#   3. cadence + hard caps — everything is monthly (the Phase-4
+#      characterization suite is the merge gate for any bump, so a faster
+#      cadence buys nothing), and open-pull-requests-limit caps the worst
+#      case: at most ~4 PRs can ever be open at once, ever.
 updates:
   - package-ecosystem: gomod
     directory: /
+    target-branch: revival/mtgo-replatform
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 2
+    groups:
+      gomod-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     labels: [dependencies, gomod]
+
   - package-ecosystem: docker
     directory: /
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 3
-    labels: [dependencies, docker]
-  - package-ecosystem: github-actions
-    directory: /
+    target-branch: revival/mtgo-replatform
     schedule:
       interval: monthly
-    open-pull-requests-limit: 3
+      day: monday
+    open-pull-requests-limit: 1
+    labels: [dependencies, docker]
+
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: revival/mtgo-replatform
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    groups:
+      actions-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
     labels: [dependencies, github-actions]
