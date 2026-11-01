@@ -10,7 +10,7 @@ import (
 func (c *Client) BoundGetFolders() ([]tg.DialogFilterClass, error) {
 	result, err := c.Raw().MessagesGetDialogFilters(context.Background())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get dialog filters: %w", err)
 	}
 	return result.Filters, nil
 }
@@ -52,7 +52,8 @@ func (c *Client) BoundReorderFolders(order []int32) error {
 }
 
 func (c *Client) BoundIncludeChat(folderID int32, chatID int64) error {
-	peer, err := resolvePeer(c, chatID)
+	ctx := context.Background()
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return fmt.Errorf("resolve peer: %w", err)
 	}
@@ -70,7 +71,8 @@ func (c *Client) BoundIncludeChat(folderID int32, chatID int64) error {
 }
 
 func (c *Client) BoundExcludeChat(folderID int32, chatID int64) error {
-	peer, err := resolvePeer(c, chatID)
+	ctx := context.Background()
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return fmt.Errorf("resolve peer: %w", err)
 	}
@@ -102,7 +104,8 @@ func (c *Client) BoundUpdateFolderColor(folderID int32, color int32) error {
 }
 
 func (c *Client) BoundPinChatInFolder(folderID int32, chatID int64) error {
-	peer, err := resolvePeer(c, chatID)
+	ctx := context.Background()
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return fmt.Errorf("resolve peer: %w", err)
 	}
@@ -120,7 +123,8 @@ func (c *Client) BoundPinChatInFolder(folderID int32, chatID int64) error {
 }
 
 func (c *Client) BoundRemoveChatFromFolder(folderID int32, chatID int64) error {
-	peer, err := resolvePeer(c, chatID)
+	ctx := context.Background()
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return fmt.Errorf("resolve peer: %w", err)
 	}

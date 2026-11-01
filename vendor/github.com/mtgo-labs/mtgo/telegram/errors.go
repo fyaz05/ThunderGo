@@ -3,6 +3,8 @@ package telegram
 import (
 	"errors"
 	"fmt"
+
+	"github.com/mtgo-labs/mtgo/telegram/peers"
 )
 
 // Client connection and lifecycle errors.
@@ -28,8 +30,9 @@ var (
 	// until an explicit Connect starts recovery with cleared storage.
 	ErrAuthKeyInvalidated = errors.New("client: auth key invalidated")
 	// ErrPeerNotFound is returned when a peer (user, chat, or channel) cannot be
-	// resolved from the given identifier.
-	ErrPeerNotFound = errors.New("client: peer not found")
+	// resolved from the given identifier. It is an alias of peers.ErrNotFound;
+	// the peers package owns resolution error identity.
+	ErrPeerNotFound = peers.ErrNotFound
 	// ErrClientClosed is returned when an operation is attempted on a client that
 	// has been closed via Disconnect or Close.
 	ErrClientClosed = errors.New("client: closed")
@@ -276,10 +279,10 @@ var (
 	ErrBanSupergroupOnly = errors.New("BanChatMember: only channels/supergroups are supported")
 	// ErrUnbanSupergroupOnly is returned when UnbanChatMember is called on a
 	// peer that is not a channel or supergroup.
-	ErrUnbanSupergroupOnly = errors.New("UnbanChatMember: only channels/supergroups are supported")
+	ErrUnbanSupergroupOnly = errors.New("unban member: only channels/supergroups are supported")
 	// ErrRestrictSupergroupOnly is returned when RestrictChatMember is called
 	// on a peer that is not a channel or supergroup.
-	ErrRestrictSupergroupOnly = errors.New("RestrictChatMember: only channels/supergroups supported")
+	ErrRestrictSupergroupOnly = errors.New("restrict member: only channels/supergroups supported")
 	// ErrGroupNoInfo is returned when creating a group succeeds but the group
 	// information cannot be extracted from the response.
 	ErrGroupNoInfo = errors.New("created group but could not extract info")

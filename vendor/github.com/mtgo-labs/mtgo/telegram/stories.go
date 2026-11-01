@@ -50,7 +50,7 @@ func (c *Client) SendStory(ctx context.Context, chatID int64, media tg.InputMedi
 		return nil, ErrMediaRequired
 	}
 
-	peer, err := resolvePeer(c.clientPeerResolver(), chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
@@ -63,12 +63,8 @@ func (c *Client) SendStory(ctx context.Context, chatID int64, media tg.InputMedi
 	if opt.NoForwards {
 		flags.Set(4)
 	}
-	if opt.Period != nil {
-		flags.Set(8)
-	}
 
 	req := &tg.StoriesSendStoryRequest{
-		Flags:        flags,
 		Pinned:       opt.Pinned,
 		Noforwards:   opt.NoForwards,
 		Peer:         peer,
@@ -77,13 +73,14 @@ func (c *Client) SendStory(ctx context.Context, chatID int64, media tg.InputMedi
 		PrivacyRules: opt.PrivacyRules,
 	}
 	if opt.Period != nil {
-		req.Period = *opt.Period
+		req.Period = *opt.Period // flags.3, derived by SetFlags (bit 8 is albums)
 	}
+	req.SetFlags()
 
 	rpc := c.Raw()
 	result, err := rpc.StoriesSendStory(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("send story: %w", err)
 	}
 
 	return extractStoryFromUpdates(result)
@@ -109,7 +106,7 @@ func (c *Client) EditStoryCaption(ctx context.Context, chatID int64, storyID int
 		return nil, ErrCaptionRequired
 	}
 
-	peer, err := resolvePeer(c.clientPeerResolver(), chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
@@ -127,7 +124,7 @@ func (c *Client) EditStoryCaption(ctx context.Context, chatID int64, storyID int
 	rpc := c.Raw()
 	result, err := rpc.StoriesEditStory(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("edit story: %w", err)
 	}
 
 	return extractStoryFromUpdates(result)
@@ -144,7 +141,7 @@ func (c *Client) EditStoryMedia(ctx context.Context, chatID int64, storyID int32
 		return nil, ErrMediaRequired
 	}
 
-	peer, err := resolvePeer(c.clientPeerResolver(), chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
@@ -162,7 +159,7 @@ func (c *Client) EditStoryMedia(ctx context.Context, chatID int64, storyID int32
 	rpc := c.Raw()
 	result, err := rpc.StoriesEditStory(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("edit story: %w", err)
 	}
 
 	return extractStoryFromUpdates(result)
@@ -184,7 +181,7 @@ func (c *Client) DeleteStories(ctx context.Context, chatID int64, storyIDs []int
 		return ErrStoryIDsRequired
 	}
 
-	peer, err := resolvePeer(c.clientPeerResolver(), chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return fmt.Errorf("resolve peer: %w", err)
 	}
@@ -220,7 +217,7 @@ func (c *Client) GetStories(ctx context.Context, userID int64, storyIDs []int32)
 		return nil, ErrStoryIDsRequired
 	}
 
-	user, err := resolveUserID(c.clientPeerResolver(), userID)
+	user, err := resolveUserID(ctx, c, userID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve user: %w", err)
 	}
@@ -243,7 +240,7 @@ func (c *Client) GetStories(ctx context.Context, userID int64, storyIDs []int32)
 	rpc := c.Raw()
 	result, err := rpc.StoriesGetStoriesByID(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get stories by id: %w", err)
 	}
 
 	stories := make([]*types.Story, 0, len(result.Stories))
@@ -270,7 +267,7 @@ func (c *Client) GetStories(ctx context.Context, userID int64, storyIDs []int32)
 //	fmt.Printf("Chat has %d active stories\n", len(stories))
 func (c *Client) GetChatStories(ctx context.Context, chatID int64) ([]*types.Story, error) {
 	c.Log.Debugf("GetChatStories chat_id=%d", chatID)
-	peer, err := resolvePeer(c.clientPeerResolver(), chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
@@ -282,7 +279,7 @@ func (c *Client) GetChatStories(ctx context.Context, chatID int64) ([]*types.Sto
 	rpc := c.Raw()
 	result, err := rpc.StoriesGetPeerStories(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get peer stories: %w", err)
 	}
 
 	var items []tg.StoryItemClass
@@ -314,7 +311,7 @@ func (c *Client) GetStoryViews(ctx context.Context, chatID int64, storyIDs []int
 		return nil, ErrStoryIDsRequired
 	}
 
-	peer, err := resolvePeer(c.clientPeerResolver(), chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
@@ -327,7 +324,7 @@ func (c *Client) GetStoryViews(ctx context.Context, chatID int64, storyIDs []int
 	rpc := c.Raw()
 	result, err := rpc.StoriesGetStoriesViews(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get stories views: %w", err)
 	}
 
 	var rawViews []tg.StoryViewsClass
@@ -354,12 +351,12 @@ func (c *Client) GetStoryViews(ctx context.Context, chatID int64, storyIDs []int
 // be resolved or the Telegram API returns an error.
 func (c *Client) ForwardStory(ctx context.Context, targetChatID int64, sourceChatID int64, storyID int32) (*types.Message, error) {
 	c.Log.Debugf("ForwardStory to=%d from=%d", targetChatID, sourceChatID)
-	targetPeer, err := resolvePeer(c.clientPeerResolver(), targetChatID)
+	targetPeer, err := resolvePeer(ctx, c, targetChatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve target peer: %w", err)
 	}
 
-	sourcePeer, err := resolvePeer(c.clientPeerResolver(), sourceChatID)
+	sourcePeer, err := resolvePeer(ctx, c, sourceChatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve source peer: %w", err)
 	}
@@ -373,7 +370,7 @@ func (c *Client) ForwardStory(ctx context.Context, targetChatID int64, sourceCha
 	rpc := c.Raw()
 	result, err := rpc.MessagesSendMedia(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("send media: %w", err)
 	}
 
 	return extractSingleMessage(result, c)
@@ -384,7 +381,7 @@ func (c *Client) ForwardStory(ctx context.Context, targetChatID int64, sourceCha
 //
 // Returns an error if the peer cannot be resolved or the Telegram API returns an error.
 func (c *Client) PinChatStories(ctx context.Context, chatID int64, storyIDs []int32) error {
-	peer, err := resolvePeer(c.clientPeerResolver(), chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return fmt.Errorf("resolve peer: %w", err)
 	}
@@ -404,7 +401,7 @@ func (c *Client) PinChatStories(ctx context.Context, chatID int64, storyIDs []in
 //
 // Returns an error if the peer cannot be resolved or the Telegram API returns an error.
 func (c *Client) ReadChatStories(ctx context.Context, chatID int64, storyIDs []int32) error {
-	peer, err := resolvePeer(c.clientPeerResolver(), chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return fmt.Errorf("resolve peer: %w", err)
 	}

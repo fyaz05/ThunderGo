@@ -47,7 +47,7 @@ type GetBoostsOption struct {
 //	fmt.Printf("Active boosts: %d\n", len(boosts))
 func (c *Client) ApplyBoost(ctx context.Context, chatID int64, opts ...*ApplyBoostOption) ([]*tg.MyBoost, error) {
 	c.Log.Debugf("ApplyBoost chat_id=%d", chatID)
-	peer, err := resolvePeer(c.clientPeerResolver(), chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
@@ -64,7 +64,7 @@ func (c *Client) ApplyBoost(ctx context.Context, chatID int64, opts ...*ApplyBoo
 	rpc := c.Raw()
 	result, err := rpc.PremiumApplyBoost(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("premium apply boost: %w", err)
 	}
 	return result.MyBoosts, nil
 }
@@ -90,7 +90,7 @@ func (c *Client) ApplyBoost(ctx context.Context, chatID int64, opts ...*ApplyBoo
 //	fmt.Printf("Boost level: %d\n", status.Level)
 func (c *Client) GetBoostsStatus(ctx context.Context, chatID int64) (*tg.PremiumBoostsStatus, error) {
 	c.Log.Debugf("GetBoostsStatus chat_id=%d", chatID)
-	peer, err := resolvePeer(c.clientPeerResolver(), chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
@@ -126,7 +126,7 @@ func (c *Client) GetBoosts(ctx context.Context, opts ...*GetBoostsOption) ([]*tg
 	rpc := c.Raw()
 	result, err := rpc.PremiumGetMyBoosts(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("premium get my boosts: %w", err)
 	}
 	return result.MyBoosts, nil
 }

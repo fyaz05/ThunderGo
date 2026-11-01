@@ -40,7 +40,7 @@ type InviteLinkOption struct {
 //	}
 //	fmt.Printf("Invite link: %s\n", link.InviteLink)
 func (c *Client) GetChatInviteLink(ctx context.Context, chatID int64, link string) (*types.ChatInviteLink, error) {
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
@@ -51,7 +51,7 @@ func (c *Client) GetChatInviteLink(ctx context.Context, chatID int64, link strin
 		Link: link,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get exported chat invite: %w", err)
 	}
 	return extractInviteLink(result)
 }
@@ -79,7 +79,7 @@ func (c *Client) GetChatInviteLink(ctx context.Context, chatID int64, link strin
 //	fmt.Printf("Created: %s\n", link.InviteLink)
 func (c *Client) CreateChatInviteLink(ctx context.Context, chatID int64, opts ...*InviteLinkOption) (*types.ChatInviteLink, error) {
 	c.Log.Debugf("CreateChatInviteLink chat_id=%d", chatID)
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
@@ -105,7 +105,7 @@ func (c *Client) CreateChatInviteLink(ctx context.Context, chatID int64, opts ..
 		Title:      title,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("export chat invite: %w", err)
 	}
 	return extractInviteLink(result)
 }
@@ -133,7 +133,7 @@ func (c *Client) CreateChatInviteLink(ctx context.Context, chatID int64, opts ..
 //	fmt.Printf("Updated: %s\n", updated.InviteLink)
 func (c *Client) EditChatInviteLink(ctx context.Context, chatID int64, link string, opts ...*InviteLinkOption) (*types.ChatInviteLink, error) {
 	c.Log.Debugf("EditChatInviteLink chat_id=%d", chatID)
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
@@ -160,7 +160,7 @@ func (c *Client) EditChatInviteLink(ctx context.Context, chatID int64, link stri
 		Title:      title,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("edit exported chat invite: %w", err)
 	}
 	return extractInviteLink(result)
 }
@@ -185,7 +185,7 @@ func (c *Client) EditChatInviteLink(ctx context.Context, chatID int64, link stri
 //	fmt.Printf("Revoked: %v\n", revoked.Revoked)
 func (c *Client) RevokeChatInviteLink(ctx context.Context, chatID int64, link string) (*types.ChatInviteLink, error) {
 	c.Log.Debugf("RevokeChatInviteLink chat_id=%d", chatID)
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
@@ -197,7 +197,7 @@ func (c *Client) RevokeChatInviteLink(ctx context.Context, chatID int64, link st
 		Link:    link,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("edit exported chat invite: %w", err)
 	}
 	return extractInviteLink(result)
 }
@@ -250,7 +250,7 @@ func extractInviteLink(result tg.ExportedChatInviteClass) (*types.ChatInviteLink
 // Returns a slice of ChatInviteLinkJoiner objects or an error if the peer
 // cannot be resolved or the RPC call fails.
 func (c *Client) GetChatInviteLinkJoiners(ctx context.Context, chatID int64, link string, limit int) ([]*types.ChatInviteLinkJoiner, error) {
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
@@ -264,7 +264,7 @@ func (c *Client) GetChatInviteLinkJoiners(ctx context.Context, chatID int64, lin
 		Limit: int32(limit),
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get chat invite importers: %w", err)
 	}
 	joiners := make([]*types.ChatInviteLinkJoiner, 0, len(result.Importers))
 	for _, imp := range result.Importers {
@@ -285,14 +285,14 @@ func (c *Client) GetChatInviteLinkJoiners(ctx context.Context, chatID int64, lin
 // Returns a slice of ChatInviteLink objects or an error if the peer or admin
 // cannot be resolved or the RPC call fails.
 func (c *Client) GetChatAdminInviteLinks(ctx context.Context, chatID int64, adminID int64, limit int) ([]*types.ChatInviteLink, error) {
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
 	if limit <= 0 {
 		limit = 50
 	}
-	user, err := resolveUserID(c, adminID)
+	user, err := resolveUserID(ctx, c, adminID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve admin: %w", err)
 	}
@@ -303,7 +303,7 @@ func (c *Client) GetChatAdminInviteLinks(ctx context.Context, chatID int64, admi
 		Limit:   int32(limit),
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get exported chat invites: %w", err)
 	}
 	links := make([]*types.ChatInviteLink, 0)
 	users := make(map[int64]tg.UserClass)
@@ -330,7 +330,7 @@ func (c *Client) GetChatAdminInviteLinks(ctx context.Context, chatID int64, admi
 // Returns an error if the peer cannot be resolved or the deletion fails.
 func (c *Client) DeleteChatInviteLink(ctx context.Context, chatID int64, link string) error {
 	c.Log.Debugf("DeleteChatInviteLink chat_id=%d", chatID)
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return fmt.Errorf("resolve peer: %w", err)
 	}
@@ -353,11 +353,11 @@ func (c *Client) DeleteChatInviteLink(ctx context.Context, chatID int64, link st
 // Returns an error if the peer or user cannot be resolved or the approval fails.
 func (c *Client) ApproveChatJoinRequest(ctx context.Context, chatID int64, userID int64) error {
 	c.Log.Debugf("ApproveChatJoinRequest chat_id=%d user_id=%d", chatID, userID)
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return fmt.Errorf("resolve peer: %w", err)
 	}
-	user, err := resolveUserID(c, userID)
+	user, err := resolveUserID(ctx, c, userID)
 	if err != nil {
 		return fmt.Errorf("resolve user: %w", err)
 	}
@@ -380,11 +380,11 @@ func (c *Client) ApproveChatJoinRequest(ctx context.Context, chatID int64, userI
 // Returns an error if the peer or user cannot be resolved or the rejection fails.
 func (c *Client) DeclineChatJoinRequest(ctx context.Context, chatID int64, userID int64) error {
 	c.Log.Debugf("DeclineChatJoinRequest chat_id=%d user_id=%d", chatID, userID)
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return fmt.Errorf("resolve peer: %w", err)
 	}
-	user, err := resolveUserID(c, userID)
+	user, err := resolveUserID(ctx, c, userID)
 	if err != nil {
 		return fmt.Errorf("resolve user: %w", err)
 	}
