@@ -39,27 +39,26 @@ import (
 //	fmt.Println("pinned:", pinned.ID)
 func (c *Client) PinMessage(ctx context.Context, chatID int64, messageID int32, opts ...*params.PinMessage) (*types.Message, error) {
 	c.Log.Debugf("PinMessage chat_id=%d msg_id=%d", chatID, messageID)
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
 	opt := params.GetOptDef(&params.PinMessage{}, opts...)
 
-	var flags tg.Fields
-	flags.Set(0)
-	if opt.Silent {
-		flags.Set(5)
-	}
-
-	rpc := c.Raw()
-	result, err := rpc.MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
-		Flags:  flags,
+	// Flags derive from fields via SetFlags: silent is flags.0, unpin flags.1,
+	// pm_oneside flags.2. Never hand-set bit 5 — it does not exist in
+	// messages.updatePinnedMessage#d2aaf7ec.
+	req := &tg.MessagesUpdatePinnedMessageRequest{
 		Silent: opt.Silent,
 		Peer:   peer,
 		ID:     messageID,
-	})
+	}
+	req.SetFlags()
+
+	rpc := c.Raw()
+	result, err := rpc.MessagesUpdatePinnedMessage(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("update pinned message: %w", err)
 	}
 	return extractSingleMessage(result, c)
 }
@@ -90,20 +89,22 @@ func (c *Client) PinMessage(ctx context.Context, chatID int64, messageID int32, 
 //	fmt.Println("unpinned:", msg.ID)
 func (c *Client) UnpinMessage(ctx context.Context, chatID int64, messageID int32) (*types.Message, error) {
 	c.Log.Debugf("UnpinMessage chat_id=%d msg_id=%d", chatID, messageID)
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
 
-	rpc := c.Raw()
-	result, err := rpc.MessagesUpdatePinnedMessage(ctx, &tg.MessagesUpdatePinnedMessageRequest{
-		Flags: (1 << 0) | (1 << 1),
-		Unpin: true,
+	req := &tg.MessagesUpdatePinnedMessageRequest{
+		Unpin: true, // flags.1, derived by SetFlags; bit 0 is silent
 		Peer:  peer,
 		ID:    messageID,
-	})
+	}
+	req.SetFlags()
+
+	rpc := c.Raw()
+	result, err := rpc.MessagesUpdatePinnedMessage(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("update pinned message: %w", err)
 	}
 	return extractSingleMessage(result, c)
 }
@@ -132,7 +133,7 @@ func (c *Client) UnpinMessage(ctx context.Context, chatID int64, messageID int32
 //	fmt.Println("affected pts:", pts)
 func (c *Client) UnpinAllMessages(ctx context.Context, chatID int64) (int, error) {
 	c.Log.Debugf("UnpinAllMessages chat_id=%d", chatID)
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return 0, fmt.Errorf("resolve peer: %w", err)
 	}

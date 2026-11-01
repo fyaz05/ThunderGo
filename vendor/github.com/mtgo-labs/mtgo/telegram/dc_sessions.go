@@ -97,15 +97,48 @@ type dcSessions struct {
 	initLocks  map[int]*sync.Mutex
 	creations  map[*dcSessionCreation]uint64
 	generation uint64
+
+	// dcAuthKeys holds, per DC, the auth key of the first authorized
+	// session created on that DC (bot or user). Authorization on a foreign DC
+	// (auth.importBotAuthorization or auth export/import) is heavily
+	// rate-limited (FLOOD_WAIT), so only one session per DC performs it;
+	// every additional transfer session on that DC is a shifted session
+	// sharing this key with a fresh session ID (tdesktop pattern).
+	dcAuthKeys map[int]*dcAuthKeyInfo
+}
+
+type dcAuthKeyInfo struct {
+	key  []byte
+	salt int64
 }
 
 func newDCSessions() *dcSessions {
 	return &dcSessions{
-		entries:   make(map[int]*dcSessionEntry),
-		pools:     make(map[int]*dcSessionPool),
-		initLocks: make(map[int]*sync.Mutex),
-		creations: make(map[*dcSessionCreation]uint64),
+		entries:    make(map[int]*dcSessionEntry),
+		pools:      make(map[int]*dcSessionPool),
+		initLocks:  make(map[int]*sync.Mutex),
+		creations:  make(map[*dcSessionCreation]uint64),
+		dcAuthKeys: make(map[int]*dcAuthKeyInfo),
 	}
+}
+
+// setDCAuthKey records the first authorized key on a DC.
+func (d *dcSessions) setDCAuthKey(dcID int, key []byte, salt int64, generation uint64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.generation != generation {
+		return
+	}
+	if _, ok := d.dcAuthKeys[dcID]; !ok {
+		d.dcAuthKeys[dcID] = &dcAuthKeyInfo{key: key, salt: salt}
+	}
+}
+
+// dcAuthKey returns the first authorized key recorded for a DC, if any.
+func (d *dcSessions) dcAuthKey(dcID int) *dcAuthKeyInfo {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.dcAuthKeys[dcID]
 }
 
 func (d *dcSessions) beginCreation(parent context.Context, generation uint64) (*dcSessionCreation, context.Context, bool) {
@@ -277,6 +310,7 @@ func (d *dcSessions) remove(dcID int) {
 	p := d.pools[dcID]
 	delete(d.pools, dcID)
 	delete(d.initLocks, dcID)
+	delete(d.dcAuthKeys, dcID)
 	d.mu.Unlock()
 	waits := stopDCSessionCreations(creations)
 
@@ -317,6 +351,7 @@ func (d *dcSessions) cleanup(waitForDial ...bool) {
 	d.entries = make(map[int]*dcSessionEntry)
 	d.pools = make(map[int]*dcSessionPool)
 	d.initLocks = make(map[int]*sync.Mutex)
+	d.dcAuthKeys = make(map[int]*dcAuthKeyInfo)
 	d.mu.Unlock()
 	waits := stopDCSessionCreations(creations)
 
@@ -461,11 +496,18 @@ func (c *Client) dcRPCPool(ctx context.Context, dcID int, size int) ([]*tg.RPCCl
 	}
 
 	homeDC := c.homeDC()
-	// Same-DC: the main session multiplexes concurrent requests natively and
-	// has robust reconnection logic. Return it for every worker instead of
-	// creating fragile side sessions that share the auth key and cascade-fail
-	// when one is replaced (killing sessions other workers still use).
+	// Same-DC: use dedicated shared-auth-key transfer sessions (tdesktop-style
+	// shifted sessions) so each worker gets its own TCP connection instead of
+	// multiplexing every worker through the main session, which caps aggregate
+	// throughput at a single connection's bandwidth.
 	if dcID == homeDC || homeDC == 0 {
+		if pool, poolErr := c.ensureHomeTransferPool(ctx, size); poolErr == nil {
+			return pool.rpcClients(), nil
+		} else {
+			// Pool creation failed (e.g. dial error): fall back to main-session
+			// multiplexing, which has robust reconnection logic.
+			c.Log.Warnf("home transfer pool creation failed (size=%d): %v; falling back to main-session multiplexing", size, poolErr)
+		}
 		mainRPC := c.Raw()
 		rpcs := make([]*tg.RPCClient, size)
 		for i := range rpcs {
@@ -510,24 +552,64 @@ func (c *Client) ensureDCRPCPool(ctx context.Context, dcID int, size int) (*dcSe
 	if pool != nil {
 		entries = append(entries, pool.snapshot(0)...)
 	}
-	created := make([]*dcSessionEntry, 0, size-len(entries))
-	releases := make([]func(), 0, size-len(entries))
+	needed := size - len(entries)
+	created := make([]*dcSessionEntry, 0, needed)
+	releases := make([]func(), 0, needed)
 	defer func() {
 		for _, release := range releases {
 			release()
 		}
 	}()
-	for len(entries) < size {
-		entry, release, err := c.createDCSessionCandidate(ctx, dcID, generation)
-		if err != nil {
-			for _, newEntry := range created {
-				newEntry.close()
-			}
-			return nil, err
+	// Create the missing sessions in parallel: each requires a TCP handshake
+	// plus auth export/import, so serial creation would stall the first
+	// parallel transfer for seconds on distant DCs.
+	if needed > 0 {
+		var (
+			wg       sync.WaitGroup
+			mu       sync.Mutex
+			firstErr error
+		)
+		newEntries := make([]*dcSessionEntry, needed)
+		newReleases := make([]func(), needed)
+		for k := 0; k < needed; k++ {
+			wg.Add(1)
+			go func(k int) {
+				defer wg.Done()
+				entry, release, err := c.createDCSessionCandidate(ctx, dcID, generation)
+				if err != nil {
+					if release != nil {
+						release()
+					}
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mu.Unlock()
+					return
+				}
+				newEntries[k] = entry
+				newReleases[k] = release
+			}(k)
 		}
-		entries = append(entries, entry)
-		created = append(created, entry)
-		releases = append(releases, release)
+		wg.Wait()
+		if firstErr != nil {
+			for _, newEntry := range newEntries {
+				if newEntry != nil {
+					newEntry.close()
+				}
+			}
+			for _, release := range newReleases {
+				if release != nil {
+					release()
+				}
+			}
+			return nil, firstErr
+		}
+		for k := range newEntries {
+			entries = append(entries, newEntries[k])
+			created = append(created, newEntries[k])
+			releases = append(releases, newReleases[k])
+		}
 	}
 
 	if pool == nil {
@@ -639,6 +721,66 @@ func (c *Client) replaceDCRPCPoolEntryIfCurrent(
 	return entry.rpc, nil
 }
 
+// sendTransferInitConnection sends the mandatory invokeWithLayer(initConnection)
+// handshake on a freshly connected transfer session. Telegram's frontends close
+// unidentified sessions within seconds — pool sessions skip the PFS bind that
+// normally carries initConnection on the main session, so without this the DC
+// kills the connection mid-transfer (observed as "server closed connection
+// (EOF) after 0-8s", chunk retries, and write-breaker churn).
+func (c *Client) sendTransferInitConnection(ctx context.Context, sess *session.Session) error {
+	query := wrapInitConnection(c.config(), &tg.HelpGetConfigRequest{})
+	initCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if _, err := sess.Invoke(initCtx, query, 3, 15*time.Second); err != nil {
+		return fmt.Errorf("transfer session init connection: %w", err)
+	}
+	return nil
+}
+
+// createShiftedDCSession builds an additional cross-DC session by sharing the
+// first authorized key on that DC (unique session ID per session, so the
+// server never sees the same (key, session) pair twice). Works for bot and
+// user accounts alike: the authorization lives in the key, not the session.
+func (c *Client) createShiftedDCSession(
+	ctx context.Context,
+	dc session.DataCenter,
+	dcID int,
+	sessionTp *sessionTransport,
+	info *dcAuthKeyInfo,
+) (*dcSessionEntry, error) {
+	cfg := c.config()
+	dcStorage := NewMemoryStorage()
+	if err := dcStorage.SetAuthKey(info.key); err != nil {
+		sessionTp.Close()
+		return nil, fmt.Errorf("dc session: set auth key DC %d: %w", dcID, err)
+	}
+	sess, err := session.NewSession(dc, dcStorage, cfg.Device.DeviceModel, cfg.Device.AppVersion,
+		cfg.Device.SystemLangCode, cfg.Device.LangCode)
+	if err != nil {
+		sessionTp.Close()
+		return nil, fmt.Errorf("dc session: create session DC %d: %w", dcID, err)
+	}
+	configureSessionDispatch(sess, c)
+	configureSessionHealth(sess, cfg, c.connMetrics)
+	sess.SetUpdateHandler(func(obj tg.TLObject) {})
+	sess.SetServerSalt(info.salt)
+	sess.SetServerTime(time.Now())
+
+	if err := sess.Connect(sessionTp, 15*time.Second); err != nil {
+		sessionTp.Close()
+		return nil, fmt.Errorf("dc session: connect DC %d: %w", dcID, err)
+	}
+	// Identify the session (invokeWithLayer+initConnection); unidentified
+	// sessions are culled by the server within seconds.
+	if err := c.sendTransferInitConnection(ctx, sess); err != nil {
+		sess.Stop()
+		sessionTp.Close()
+		return nil, fmt.Errorf("dc session DC %d: %w", dcID, err)
+	}
+	c.Log.Debugf("shifted DC session established for DC %d (%s, shared key)", dcID, dc.Address())
+	return newDCSessionEntry(sess, sessionTp, c), nil
+}
+
 func (c *Client) createDCSession(
 	ctx context.Context,
 	dcID int,
@@ -650,7 +792,7 @@ func (c *Client) createDCSession(
 		ID:       dcID,
 		TestMode: c.config().TestMode,
 		IPv6:     c.config().IPv6,
-	}
+	}.TransferDataCenter()
 	addr := dc.Address()
 	if addr == "" {
 		return nil, fmt.Errorf("download: %w: %d", ErrUnknownDC, dcID)
@@ -685,6 +827,14 @@ func (c *Client) createDCSession(
 	if dcID == homeDC {
 		sessionTp.Close()
 		return nil, errDCBecameHome
+	}
+
+	// Reuse the first authorized key on this DC (bot or user). Only the
+	// first session per DC performs authorization (heavily rate-limited by
+	// the server); every additional session is a shifted session sharing
+	// that key with a unique session ID.
+	if info := c.dcSessions.dcAuthKey(dcID); info != nil {
+		return c.createShiftedDCSession(ctx, dc, dcID, sessionTp, info)
 	}
 
 	dcStorage := NewMemoryStorage()
@@ -743,18 +893,128 @@ func (c *Client) createDCSession(
 		sessionTp.Close()
 		return nil, ErrNotConnected
 	}
+	// Bots authorize the fresh DH key of each auxiliary session directly with
+	// the bot token. Not every DC serves a bot's authorization record: the
+	// server may redirect the import with USER_MIGRATE_X to the bot's home DC
+	// (observed with Telegram Business bots whose files live on DC 2). The
+	// transfer session cannot follow the redirect — the file still lives on
+	// dcID — so the redirect falls back to the standard export/import
+	// authorization transfer from the home DC, which is how TDLib's
+	// DcAuthManager authorizes bot sessions on foreign DCs. User accounts
+	// keep the export/import flow directly.
+	if c.IsBot() {
+		if err := c.authorizeBotDCSession(ctx, rpc, dcID); err != nil {
+			sess.Stop()
+			sessionTp.Close()
+			return nil, fmt.Errorf("download: %w", err)
+		}
+		c.dcSessions.setDCAuthKey(dcID, result.AuthKey, sess.ServerSalt(), generation)
+		c.Log.Infof("Bot auth complete for DC %d", dcID)
+		return entry, nil
+	}
+
+	if err := c.authorizeSessionViaTransfer(ctx, rpc, dcID); err != nil {
+		sess.Stop()
+		sessionTp.Close()
+		return nil, fmt.Errorf("download: %w", err)
+	}
+
+	// Record the user key so additional pool sessions on this DC (and
+	// replacements for dead ones) skip the DH + export/import dance and
+	// connect as shifted sessions sharing this key.
+	c.dcSessions.setDCAuthKey(dcID, result.AuthKey, sess.ServerSalt(), generation)
+
+	c.Log.Infof("Auth transfer complete for DC %d", dcID)
+
+	return entry, nil
+}
+
+// authorizeBotDCSession authorizes a freshly connected auxiliary-DC session
+// for a bot account. The primary path is auth.importBotAuthorization, which
+// authorizes the new key directly with the bot token. Some DCs refuse to
+// serve a bot's authorization record and redirect the import to the bot's
+// home DC with USER_MIGRATE_X; since the transfer session is bound to the
+// file's DC and cannot move, the redirect falls back to the standard auth
+// export/import transfer from the home DC (see authorizeSessionViaTransfer).
+func (c *Client) authorizeBotDCSession(ctx context.Context, rpc *tg.RPCClient, dcID int) error {
+	cfg := c.config()
+	if d := c.floodReg().floodWaitRemaining(tg.AuthImportBotAuthorizationTypeID); d > 0 {
+		c.Log.Warnf("bot auth on DC %d: waiting %v for FLOOD_WAIT before retrying", dcID, d.Truncate(time.Second))
+	}
+	err := invokeWithFloodPolicy(ctx, transferFloodThreshold, tg.AuthImportBotAuthorizationTypeID, c.floodReg(), func() error {
+		_, botAuthErr := rpc.AuthImportBotAuthorization(ctx, &tg.AuthImportBotAuthorizationRequest{
+			APIID:        cfg.APIID,
+			APIHash:      cfg.APIHash,
+			BotAuthToken: c.BotToken(),
+		})
+		return botAuthErr
+	})
+	if err == nil {
+		return nil
+	}
+	redirectDC, redirected := botAuthImportRedirect(err)
+	if !redirected {
+		return fmt.Errorf("import bot auth on DC %d: %w", dcID, err)
+	}
+	c.Log.Infof("Bot auth import on DC %d redirected to DC %d; falling back to auth transfer", dcID, redirectDC)
+	if transferErr := c.authorizeSessionViaTransfer(ctx, rpc, dcID); transferErr != nil {
+		return fmt.Errorf(
+			"import bot auth on DC %d: %w (server redirected to DC %d; auth transfer fallback failed: %w)",
+			dcID, err, redirectDC, transferErr,
+		)
+	}
+	return nil
+}
+
+// botAuthImportRedirect reports whether err is a USER_MIGRATE_X redirect
+// returned by auth.importBotAuthorization, returning the redirected DC.
+// The server sends it when the requested DC will not authorize the bot's
+// fresh key and the import must be served from the bot's home DC instead.
+func botAuthImportRedirect(err error) (targetDC int, redirected bool) {
+	var rpcErr *tgerr.Error
+	if !errors.As(err, &rpcErr) || rpcErr.Code != 303 || !rpcErr.IsType("USER_MIGRATE") || rpcErr.Argument <= 0 {
+		return 0, false
+	}
+	return rpcErr.Argument, true
+}
+
+// authorizeSessionViaTransfer authorizes a freshly connected auxiliary-DC
+// session via the standard authorization transfer: auth.exportAuthorization
+// on the home DC, then auth.importAuthorization into the target session.
+// This works for user and bot accounts alike (TDLib's DcAuthManager uses it
+// for every non-main DC).
+//
+// The export→import pair is serialized per target DC: Telegram returns the
+// same (id, bytes) for concurrent exports toward one DC until they are
+// imported, so parallel imports of colliding exports fail with
+// AUTH_BYTES_INVALID (observed with parallel pool creation; the same race
+// wzgram hits with bot media-session pools).
+func (c *Client) authorizeSessionViaTransfer(ctx context.Context, rpc *tg.RPCClient, dcID int) error {
+	c.authTransferMu.Lock(dcID)
+	defer c.authTransferMu.Unlock(dcID)
+
+	for _, m := range []struct {
+		name   string
+		method uint32
+	}{
+		{"export", tg.AuthExportAuthorizationTypeID},
+		{"import", tg.AuthImportAuthorizationTypeID},
+	} {
+		if d := c.floodReg().floodWaitRemaining(m.method); d > 0 {
+			c.Log.Warnf("auth %s for DC %d: waiting %v for FLOOD_WAIT before retrying", m.name, dcID, d.Truncate(time.Second))
+		}
+	}
+
 	var exportResult *tg.AuthExportedAuthorization
-	err = retryFloodWait(ctx, func() error {
+	err := invokeWithFloodPolicy(ctx, transferFloodThreshold, tg.AuthExportAuthorizationTypeID, c.floodReg(), func() error {
 		var exportErr error
 		exportResult, exportErr = c.exportAuthDirect(ctx, dcID)
 		return exportErr
 	})
 	if err != nil {
-		sess.Stop()
-		sessionTp.Close()
-		return nil, fmt.Errorf("download: export auth for DC %d: %w", dcID, err)
+		return fmt.Errorf("export auth for DC %d: %w", dcID, err)
 	}
-	err = retryFloodWait(ctx, func() error {
+	err = invokeWithFloodPolicy(ctx, transferFloodThreshold, tg.AuthImportAuthorizationTypeID, c.floodReg(), func() error {
 		_, importErr := rpc.AuthImportAuthorization(ctx, &tg.AuthImportAuthorizationRequest{
 			ID:    exportResult.ID,
 			Bytes: exportResult.Bytes,
@@ -762,14 +1022,9 @@ func (c *Client) createDCSession(
 		return importErr
 	})
 	if err != nil {
-		sess.Stop()
-		sessionTp.Close()
-		return nil, fmt.Errorf("download: import auth on DC %d: %w", dcID, err)
+		return fmt.Errorf("import auth on DC %d: %w", dcID, err)
 	}
-
-	c.Log.Infof("Auth transfer complete for DC %d", dcID)
-
-	return entry, nil
+	return nil
 }
 
 // exportAuthDirect invokes auth.exportAuthorization on the home DC session
@@ -833,7 +1088,7 @@ func (d *dcSessionInvoker) RPCInvoke(ctx context.Context, input tg.TLObject, dec
 
 	query, initializesAPI := prepareAPIQuery(d.client.config(), d.apiInit.Load(), input)
 
-	err = retryTransferFloodWait(ctx, func() error {
+	err = d.client.invokeFlood(ctx, query, func() error {
 		var invokeErr error
 		result, invokeErr = d.sess.Invoke(ctx, query, retries, timeout)
 		if invokeErr != nil {
@@ -883,7 +1138,7 @@ func (d *dcSessionInvoker) RPCInvokeRaw(ctx context.Context, input tg.TLObject) 
 
 	query, initializesAPI := prepareAPIQuery(d.client.config(), d.apiInit.Load(), input)
 
-	err = retryTransferFloodWait(ctx, func() error {
+	err = d.client.invokeFlood(ctx, query, func() error {
 		var invokeErr error
 		data, invokeErr = d.sess.InvokeRaw(ctx, query, d.client.invokeRetries(), d.client.invokeTimeout(ctx))
 		return invokeErr

@@ -258,7 +258,7 @@ func (c *Client) StartMessageDraft(ctx context.Context, chatID int64, opts ...*D
 }
 
 func (c *Client) draftPeer(ctx context.Context, chatID int64) (tg.InputPeerClass, error) {
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		peer, err = c.ResolvePeer(ctx, chatID)
 		if err != nil {
@@ -267,7 +267,7 @@ func (c *Client) draftPeer(ctx context.Context, chatID int64) (tg.InputPeerClass
 		return peer, nil
 	}
 	if c.IsBot() {
-		peer, err = c.resolveBotPeerAccessHash(ctx, peer)
+		peer, err = c.peersManager().EnsureUsable(ctx, peer)
 		if err != nil {
 			return nil, fmt.Errorf("resolve peer: %w", err)
 		}

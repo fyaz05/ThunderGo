@@ -250,13 +250,16 @@ type Config struct {
 	// ReqTimeout is the default timeout applied to RPC requests when no deadline
 	// is set on the context. Defaults to 60 seconds. Enforced minimum of 1 second.
 	ReqTimeout time.Duration
-	// RetryInterval is the initial delay between RPC retry attempts. The delay
-	// doubles on each subsequent retry up to a cap. Defaults to 5 seconds.
+	// RetryInterval is a legacy knob that no code path reads (the session
+	// transport retry uses its own 100ms→2s exponential backoff). Retained
+	// for configuration compatibility; do not set it in new code.
 	RetryInterval time.Duration
-	// Retries is the number of retries for RPC calls on transient errors
-	// (timeouts, connection resets, 500s). Non-retryable errors (401, 400, 403)
-	// fail immediately regardless of this setting. Defaults to 5.
-	// The send timeout per attempt is controlled by ReqTimeout.
+	// Retries is the number of transport-level attempts per RPC call inside
+	// the session (timeouts, connection resets). Non-retryable server errors
+	// fail immediately regardless of this setting. The backoff between
+	// attempts is exponential (100ms doubling, capped at 2s) and honors the
+	// context. Flood waits and reconnect retries are governed separately by
+	// SleepThreshold and MaxRPCReconnectRetries. Defaults to 3.
 	Retries int
 	// MaxConcurrentTrans limits how many file transfers may run in parallel.
 	// Keep low on bandwidth-constrained networks to avoid throttling.
@@ -280,9 +283,13 @@ type Config struct {
 	MaxTopicCacheSize int
 	// PeerCacheSize caps the number of peer and username entries cached in memory.
 	// When the limit is exceeded, the oldest entries are evicted (FIFO).
-	// Setting to 0 (default) disables eviction — the cache grows without bound.
-	// Recommended: 5000.
+	// 0 disables the limit; the default is 5000.
 	PeerCacheSize int
+	// PeerIndexTTL bounds how long cached username→ID and phone→ID mappings
+	// stay fresh; older mappings are dropped on next use and re-resolved, so
+	// renamed peers recover without a restart. 0 applies the 24h default
+	// (matching mtcute/MTKruto); a negative value disables expiry.
+	PeerIndexTTL time.Duration
 	// ParseMode selects the default formatting mode for message text.
 	// Use params.ParseModeMarkdown, params.ParseModeHTML, or a raw string
 	// like "MarkdownV2". Zero value means no parsing.
@@ -365,8 +372,9 @@ type Config struct {
 	// TransportModeIntermediate, TransportModePaddedIntermediate, and
 	// TransportModeFull.
 	TransportMode TransportMode
-	// SavePeers persists encountered peer identifiers to the session file so
-	// that they survive restarts without re-fetching.
+	// SavePeers persists encountered peer identifiers to the configured
+	// storage backend (Config.Storage) so that they survive restarts without
+	// re-fetching.
 	SavePeers bool
 	// Storage is an optional storage backend for persisting session data.
 	// When set, it takes precedence over InMemory and file-based session
@@ -472,7 +480,9 @@ type Config struct {
 	// UploadPoolSize controls the number of parallel upload sessions created
 	// on the home DC for file uploads. Each session shares the main session's
 	// permanent auth key (no DH exchange) and runs its own TCP connection.
-	// Defaults to 4 for throughput; set to 1 to use the main session only.
+	// The effective size never exceeds the file's part count or the upload
+	// worker count. Defaults to 8 for throughput (matching Telegram Desktop's
+	// media session cap); set to 1 to use the main session only.
 	UploadPoolSize int
 	// EndpointCoolDown is the time to wait before retrying a failed DC
 	// endpoint. Failed endpoints are skipped until the cool-down expires.
@@ -582,10 +592,11 @@ func DeviceTDesktopWindows() DeviceConfig {
 //	cfg.InMemory = true
 //	client, err := telegram.NewClient(apiID, apiHash, &cfg)
 var DefaultConfig = Config{
+	Retries:             3,
 	SleepThreshold:      10 * time.Second,
 	Timeout:             60 * time.Second,
-		ReqTimeout:          15 * time.Second,
-		RetryInterval:       5 * time.Second,
+	ReqTimeout:          15 * time.Second,
+	RetryInterval:       5 * time.Second,
 	MaxConcurrentTrans:  1,
 	DispatchQueueSize:   defaultDispatchQueueSize,
 	MaxMessageCacheSize: 1000,
@@ -616,6 +627,6 @@ var DefaultConfig = Config{
 	HealthPongTimeout:  30 * time.Second,
 	ConnPoolTTL:        10 * time.Second,
 	DCPoolSize:         1,
-	UploadPoolSize:     4,
+	UploadPoolSize:     8,
 	EndpointCoolDown:   16 * time.Second,
 }

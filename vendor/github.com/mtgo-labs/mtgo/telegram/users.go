@@ -32,7 +32,7 @@ func (c *Client) GetUsers(ctx context.Context, userIDs []int64) ([]*types.User, 
 	c.Log.Debugf("GetUsers count=%d", len(userIDs))
 	inputs := make([]tg.InputUserClass, len(userIDs))
 	for i, id := range userIDs {
-		u, err := resolveUserID(c, id)
+		u, err := resolveUserID(ctx, c, id)
 		if err != nil {
 			return nil, fmt.Errorf("resolve user %v: %w", id, err)
 		}
@@ -87,12 +87,12 @@ func (c *Client) GetMe(ctx context.Context) (*types.User, error) {
 		ID: &tg.InputUserSelf{},
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get full user: %w", err)
 	}
 
 	uf, ok := result.(*tg.UsersUserFull)
 	if !ok {
-		return nil, fmt.Errorf("GetMe: unexpected type %T", result)
+		return nil, fmt.Errorf("get me: unexpected type %T", result)
 	}
 	if len(uf.Users) > 0 {
 		user := types.ParseUser(uf.Users[0])
@@ -138,7 +138,7 @@ func (c *Client) GetMe(ctx context.Context) (*types.User, error) {
 //	}
 func (c *Client) GetCommonChats(ctx context.Context, userID int64, limit int) ([]*types.Chat, error) {
 	c.Log.Debugf("GetCommonChats user_id=%d", userID)
-	user, err := resolveUserID(c, userID)
+	user, err := resolveUserID(ctx, c, userID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve user: %w", err)
 	}
@@ -152,7 +152,7 @@ func (c *Client) GetCommonChats(ctx context.Context, userID int64, limit int) ([
 		Limit:  int32(limit),
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get common chats: %w", err)
 	}
 	chats := make([]*types.Chat, 0)
 	switch v := result.(type) {
@@ -204,7 +204,7 @@ func (c *Client) UpdateProfile(ctx context.Context, firstName, lastName, bio str
 		About:     b,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("update profile: %w", err)
 	}
 	return types.ParseUser(result), nil
 }

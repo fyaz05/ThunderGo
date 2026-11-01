@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/mtgo-labs/mtgo/telegram/params"
 	"github.com/mtgo-labs/mtgo/telegram/types"
@@ -270,7 +271,7 @@ func (c *Client) BoundForwardMediaGroup(chatID int64, fromChatID int64, msgIDs [
 
 func (c *Client) BoundClick(chatID int64, msgID int32, data []byte) (*tg.MessagesBotCallbackAnswer, error) {
 	ctx := context.Background()
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, err
 	}
@@ -311,7 +312,7 @@ func (c *Client) BoundView(chatID int64, msgID int32) error {
 
 func (c *Client) BoundEditLiveLocation(chatID int64, msgID int32, lat, lng float64) (*types.Message, error) {
 	ctx := context.Background()
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, err
 	}
@@ -323,14 +324,14 @@ func (c *Client) BoundEditLiveLocation(chatID int64, msgID int32, lat, lng float
 		},
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("edit message: %w", err)
 	}
 	return extractSingleMessage(result, c)
 }
 
 func (c *Client) BoundStopLiveLocation(chatID int64, msgID int32) (*types.Message, error) {
 	ctx := context.Background()
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, err
 	}
@@ -343,7 +344,7 @@ func (c *Client) BoundStopLiveLocation(chatID int64, msgID int32) (*types.Messag
 		},
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("edit message: %w", err)
 	}
 	return extractSingleMessage(result, c)
 }
@@ -354,7 +355,7 @@ func (c *Client) BoundAcceptGiftPurchaseOffer(chatID int64, msgID int32) (*types
 		OfferMsgID: msgID,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("payments resolve star gift offer: %w", err)
 	}
 	return extractSingleMessage(result, c)
 }
@@ -367,14 +368,14 @@ func (c *Client) BoundRejectGiftPurchaseOffer(chatID int64, msgID int32) (*types
 		OfferMsgID: msgID,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("payments resolve star gift offer: %w", err)
 	}
 	return extractSingleMessage(result, c)
 }
 
 func (c *Client) BoundSummarize(chatID int64, msgID int32) (*types.Message, error) {
 	ctx := context.Background()
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, err
 	}
@@ -383,7 +384,7 @@ func (c *Client) BoundSummarize(chatID int64, msgID int32) (*types.Message, erro
 		ID:   []int32{msgID},
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get extended media: %w", err)
 	}
 	return nil, nil
 }

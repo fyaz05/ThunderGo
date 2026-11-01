@@ -37,7 +37,7 @@ import (
 //	fmt.Println(edited.ID)
 func (c *Client) EditMessageCaption(ctx context.Context, chatID int64, messageID int32, caption string, opts ...*params.EditMessage) (*types.Message, error) {
 	c.Log.Debugf("EditMessageCaption chat_id=%d msg_id=%d", chatID, messageID)
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
@@ -85,7 +85,7 @@ func (c *Client) EditMessageCaption(ctx context.Context, chatID int64, messageID
 	rpc := c.Raw()
 	result, err := rpc.MessagesEditMessage(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("edit message: %w", err)
 	}
 	return extractSingleMessage(result, c)
 }
@@ -120,7 +120,7 @@ func (c *Client) EditMessageCaption(ctx context.Context, chatID int64, messageID
 //	fmt.Println(edited.ID)
 func (c *Client) EditMessageMedia(ctx context.Context, chatID int64, messageID int32, media tg.InputMediaClass, opts ...*params.EditMessage) (*types.Message, error) {
 	c.Log.Debugf("EditMessageMedia chat_id=%d msg_id=%d", chatID, messageID)
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
@@ -172,7 +172,7 @@ func (c *Client) EditMessageMedia(ctx context.Context, chatID int64, messageID i
 	rpc := c.Raw()
 	result, err := rpc.MessagesEditMessage(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("edit message: %w", err)
 	}
 	return extractSingleMessage(result, c)
 }
@@ -206,7 +206,7 @@ func (c *Client) EditMessageMedia(ctx context.Context, chatID int64, messageID i
 //	fmt.Println(edited.ID)
 func (c *Client) EditMessageReplyMarkup(ctx context.Context, chatID int64, messageID int32, replyMarkup tg.ReplyMarkupClass) (*types.Message, error) {
 	c.Log.Debugf("EditMessageReplyMarkup chat_id=%d msg_id=%d", chatID, messageID)
-	peer, err := resolvePeer(c, chatID)
+	peer, err := resolvePeer(ctx, c, chatID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve peer: %w", err)
 	}
@@ -224,7 +224,7 @@ func (c *Client) EditMessageReplyMarkup(ctx context.Context, chatID int64, messa
 	rpc := c.Raw()
 	result, err := rpc.MessagesEditMessage(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("edit message: %w", err)
 	}
 	return extractSingleMessage(result, c)
 }

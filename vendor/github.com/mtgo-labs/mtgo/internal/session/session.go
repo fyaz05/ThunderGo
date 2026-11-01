@@ -58,8 +58,16 @@ const (
 	numFutureSalts       = 4
 	initialSaltFetchWait = 15 * time.Second
 	saltFetchInterval    = time.Hour
-	ackFlushInterval     = 30 * time.Second
-	slowWriteThreshold   = 3 * time.Second
+	// ackFlushInterval and ackFlushThreshold control msgs_ack batching.
+	// Telegram's servers flow-control connections whose received content
+	// goes unacknowledged — a 30s flush interval capped bulk downloads at
+	// roughly half of the achievable per-connection rate (the server stalls
+	// sending once too many responses are unacked). pyrogram flushes at 10
+	// pending acks with no timer; TDLib acks per read loop. Batch small and
+	// flush often: the msgs_ack envelope is a few dozen bytes.
+	ackFlushInterval   = 250 * time.Millisecond
+	ackFlushThreshold  = 16
+	slowWriteThreshold = 3 * time.Second
 )
 
 // hasDecodedResults returns true if any goroutine is waiting for a decoded TL
@@ -507,19 +515,17 @@ func NewSession(dc DataCenter, st storage.Storage, deviceModel, appVersion, syst
 	binary.LittleEndian.PutUint64(encodedSidBytes[:], uint64(sid))
 
 	s := &Session{
-		dc:          dc,
-		storage:     st,
-		deviceModel: deviceModel,
-		appVersion:  appVersion,
-		systemLang:  systemLang,
-		langCode:    langCode,
-		authKey:     authKey,
-		sessionID:   sid,
-		sidBytes:    encodedSidBytes,
-		msgFactory:  NewMsgFactory(time.Now()),
-		msgIDValidator: newMsgIDValidator(func() int64 {
-			return time.Now().Unix()
-		}),
+		dc:               dc,
+		storage:          st,
+		deviceModel:      deviceModel,
+		appVersion:       appVersion,
+		systemLang:       systemLang,
+		langCode:         langCode,
+		authKey:          authKey,
+		sessionID:        sid,
+		sidBytes:         encodedSidBytes,
+		msgFactory:       NewMsgFactory(time.Now()),
+		msgIDValidator:   newMsgIDValidator(nil),
 		pending:          NewPendingManager(),
 		containerTracker: NewContainerTracker(),
 		pingInterval:     60 * time.Second,
@@ -541,6 +547,16 @@ func NewSession(dc DataCenter, st storage.Storage, deviceModel, appVersion, syst
 		offset := time.Duration(s.msgFactory.ServerTimeOffset()) * time.Second
 		return time.Now().Add(offset)
 	})
+
+	// Inbound msg_ids are stamped in SERVER time; the validator must compare
+	// them against the server-time-corrected clock, not the raw local clock.
+	// A local clock more than ~30s behind (or ~5min ahead of) Telegram time
+	// made every inbound frame fail validation and get silently dropped —
+	// the client went deaf with healthy connections and no diagnostics
+	// (field report: update dispatch wedge after callback answers).
+	s.msgIDValidator.serverTS = func() int64 {
+		return time.Now().Unix() + s.msgFactory.ServerTimeOffset()
+	}
 
 	if len(authKey) > 0 {
 		s.authKeyID = computeAuthKeyID(authKey)
@@ -1816,6 +1832,10 @@ func (s *Session) readLoop(ctx context.Context) (retErr error) {
 	var handlers sync.WaitGroup
 	defer handlers.Wait()
 
+	// Drop-diagnostics for the msg_id validator (rate-limited logging).
+	var droppedFrames int
+	lastDropLog := time.Now()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -1876,11 +1896,28 @@ func (s *Session) readLoop(ctx context.Context) (retErr error) {
 			if _, ok := err.(*tgerr.SecurityCheckMismatch); ok {
 				return err
 			}
+			// Undecryptable or malformed frame: drop it, but log loudly —
+			// silent drops here surface later as hung RPCs and reconnect
+			// churn (e.g. the 1 MiB message-body cap incident).
+			if s.log != nil {
+				s.log.Warnf("session: dropped incoming frame (%d bytes): %v", len(data), err)
+			}
 			continue
 		}
 
-		if !s.msgIDValidator.Check(raw.MsgID) {
+		// Rate-limited logging for validation drops: a wedged validator
+		// (clock reference drift) rejects EVERY frame silently — observable
+		// only as "updates stopped" with healthy connections.
+		if ok, reason := s.msgIDValidator.CheckWithReason(raw.MsgID); !ok {
 			crypto.ReleaseAESBuf(decrypted)
+			droppedFrames++
+			if time.Since(lastDropLog) >= 10*time.Second {
+				if s.log != nil {
+					s.log.Warnf("session: dropped %d inbound frames to msg_id validation; last rejection: %s", droppedFrames, reason)
+				}
+				droppedFrames = 0
+				lastDropLog = time.Now()
+			}
 			continue
 		}
 
@@ -2136,7 +2173,7 @@ func (s *Session) ackLoop(ctx context.Context) error {
 			}
 			seen[msgID] = struct{}{}
 			buf = append(buf, msgID)
-			if len(buf) >= 8192 {
+			if len(buf) >= ackFlushThreshold {
 				if err := flush(); err != nil {
 					return err
 				}

@@ -73,6 +73,8 @@ func downloadPacingDelay(opts *params.Download, dcID, homeDC int) time.Duration 
 	return 0
 }
 
+var chunkDebug = os.Getenv("MTGO_CHUNK_DEBUG") == "1"
+
 var errParallelDownloadUnsupported = errors.New("download: parallel download unsupported for response")
 
 // ErrDownloadStalled is returned when no data has been received within the
@@ -674,6 +676,132 @@ func downloadWorkers(opts *params.Download, fileSize int64, dcID int, homeDC int
 	return min(defaultTransferWorkers, parts)
 }
 
+// downloadWindow bounds are for the per-worker adaptive in-flight window: the
+// number of chunk requests a worker keeps outstanding on its connection. A
+// window above 1 keeps the TCP pipe full across round-trips. tdesktop grows
+// per-session windows from 1 toward 4-16 parts as responses come back fast;
+// wzgram runs 3-6 workers per media session. The window starts small and
+// adapts: consecutive fast chunks grow it, slow responses shrink it — so
+// clean networks converge to maxDownloadWindow while congested or rate-limited
+// paths back off without disconnecting.
+const (
+	minDownloadWindow = 2
+	maxDownloadWindow = 4
+)
+
+// downloadRateLimits are the adaptive token-bucket defaults for chunk request
+// pacing, in requests per second. Bots are throttled harder by Telegram's file
+// DCs than user accounts, so they start lower. The limiter adapts at runtime:
+// slow chunks (>1.5s) shrink the rate, fast streaks grow it back.
+// chunkLatencyScale returns a latency reference for a chunk of the given
+// byte limit: one second per 512 KiB. A healthy maximum-size (1 MiB) chunk
+// legitimately takes about twice as long as a 512 KiB one, so the adaptive
+// window and rate limiter scale their "fast"/"slow" thresholds by this
+// reference instead of comparing every chunk against fixed wall-clock bounds
+// (which froze the window at 2 for 1 MiB chunks while 512 KiB chunks grew
+// to 4 — halving throughput at exactly the granularity the fastest clients
+// use).
+func chunkLatencyScale(limit int32) time.Duration {
+	units := int64(limit) / (512 * 1024)
+	if units < 1 {
+		units = 1
+	}
+	return time.Duration(units) * time.Second
+}
+
+var (
+	botDownloadRate  = 30.0
+	userDownloadRate = 75.0
+	minDownloadRate  = 15.0
+)
+
+// downloadLimiter is a per-transfer adaptive token bucket shared by all
+// download workers. It replaces the old fixed 25ms inter-request sleep: the
+// bucket starts permissive, backs off multiplicatively when the DC responds
+// slowly (rate limiting / near-disconnect), and recovers additively when
+// chunks come back fast — the same policy wzgram uses to top tglib-bench.
+type downloadLimiter struct {
+	mu         sync.Mutex
+	rate       float64 // tokens (requests) per second
+	burst      float64 // bucket capacity
+	tokens     float64
+	last       time.Time
+	maxRate    float64
+	fastStreak int
+}
+
+func newDownloadLimiter(rate float64) *downloadLimiter {
+	burst := rate / 2
+	if burst < 1 {
+		burst = 1
+	}
+	return &downloadLimiter{
+		rate:    rate,
+		maxRate: rate,
+		burst:   burst,
+		tokens:  burst,
+		last:    time.Now(),
+	}
+}
+
+// acquire blocks until one request token is available or ctx is done.
+func (l *downloadLimiter) acquire(ctx context.Context) error {
+	if l == nil {
+		return nil
+	}
+	for {
+		l.mu.Lock()
+		now := time.Now()
+		l.tokens += now.Sub(l.last).Seconds() * l.rate
+		l.last = now
+		if l.tokens > l.burst {
+			l.tokens = l.burst
+		}
+		if l.tokens >= 1 {
+			l.tokens--
+			l.mu.Unlock()
+			return nil
+		}
+		wait := time.Duration((1 - l.tokens) / l.rate * float64(time.Second))
+		l.mu.Unlock()
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// observe feeds a completed chunk's round-trip time back into the limiter.
+// Genuinely stalled responses (>2.5s — well past a healthy 1-2s cross-DC
+// round trip for a maximum-size chunk) shrink the allowed rate (gentle
+// exponential backoff toward minDownloadRate); sustained fast responses
+// (<1.2s) grow it back (additive, capped at the initial rate).
+func (l *downloadLimiter) observe(elapsed time.Duration, limit int32) {
+	if l == nil {
+		return
+	}
+	ref := chunkLatencyScale(limit)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if elapsed > 5*ref/2 {
+		l.rate = max(l.rate*0.85, minDownloadRate)
+		l.fastStreak = 0
+		return
+	}
+	if elapsed < 6*ref/5 {
+		l.fastStreak++
+		if l.fastStreak >= 3 && l.rate < l.maxRate {
+			l.rate = min(l.rate+2, l.maxRate)
+			l.fastStreak = 0
+		}
+	} else {
+		l.fastStreak = 0
+	}
+}
+
 func (c *Client) downloadToWriterAt(ctx context.Context, rpcs []*tg.RPCClient, dcID int, location tg.InputFileLocationClass, fileSize int64, writer io.WriterAt, opts *params.Download) (int64, error) {
 	chunkSize := chunkSizeForDownload(opts)
 
@@ -698,7 +826,29 @@ func (c *Client) downloadToWriterAt(ctx context.Context, rpcs []*tg.RPCClient, d
 	}
 
 	jobs := make(chan job, workers)
-	results := make(chan result, workers)
+	results := make(chan result, workers*maxDownloadWindow)
+	// Adaptive pacing shared by all workers. RequestDelay semantics:
+	//   negative → disabled (nil limiter)
+	//   zero     → adaptive default (bot/user aware)
+	//   positive → fixed 1/delay rate, no adaptation
+	var limiter *downloadLimiter
+	if opts == nil || opts.RequestDelay == 0 {
+		rate := userDownloadRate
+		if c.IsBot() {
+			rate = botDownloadRate
+		}
+		limiter = newDownloadLimiter(rate)
+	} else if opts.RequestDelay > 0 {
+		limiter = newDownloadLimiter(float64(time.Second) / float64(opts.RequestDelay))
+	}
+	// send delivers a worker result, abandoning the send when the context is
+	// cancelled so in-flight workers cannot leak.
+	send := func(r result) {
+		select {
+		case results <- r:
+		case <-ctx.Done():
+		}
+	}
 	var done atomic.Int64
 	var wg sync.WaitGroup
 
@@ -706,97 +856,181 @@ func (c *Client) downloadToWriterAt(ctx context.Context, rpcs []*tg.RPCClient, d
 		wg.Add(1)
 		go func(workerIdx int) {
 			defer wg.Done()
+
+			var rpcMu sync.Mutex // guards currentRPC, recoveries, backoff, window
 			currentRPC := rpcs[workerIdx%len(rpcs)]
 			recoveries := 0
 			backoff := time.Duration(0)
+
+			// Adaptive pipelining window: the number of chunk requests kept
+			// in flight on this connection. Starts at 2; four consecutive
+			// sub-second chunks grow it toward maxDownloadWindow, a response
+			// slower than 2.5s shrinks it (floor 1).
+			window := minDownloadWindow
+			fastStreak := 0
+			sem := make(chan struct{}, maxDownloadWindow)
+			var inflight sync.WaitGroup
+			defer inflight.Wait()
+
 			for j := range jobs {
-				var file *tg.UploadFile
+				// Wait until in-flight (occupied sem slots) is below the current
+				// adaptive window. The sem keeps a hard cap of maxDownloadWindow;
+				// the gate tracks the adaptive limit.
 				for {
+					rpcMu.Lock()
+					w := window
+					rpcMu.Unlock()
+					if len(sem) < w {
+						break
+					}
 					select {
 					case <-ctx.Done():
-						results <- result{offset: j.offset, err: ctx.Err()}
 						return
-					default:
+					case <-time.After(2 * time.Millisecond):
 					}
+				}
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				inflight.Add(1)
+				go func(j job) {
+					defer inflight.Done()
+					defer func() { <-sem }()
+					defer func() {
+						if r := recover(); r != nil {
+							send(result{offset: j.offset, err: fmt.Errorf("download worker panic: %v", r)})
+						}
+					}()
 
-					res, err := currentRPC.UploadGetFile(ctx, &tg.UploadGetFileRequest{
-						Location: location,
-						Offset:   j.offset,
-						Limit:    j.limit,
-					})
-					if err != nil {
-						recoveredRPC, recovered, recoverErr := c.recoverDownloadWorkerRPC(ctx, dcID, len(rpcs), workerIdx, err)
-						if recoverErr != nil {
-							results <- result{offset: j.offset, err: recoverErr}
+					var file *tg.UploadFile
+					for {
+						select {
+						case <-ctx.Done():
+							send(result{offset: j.offset, err: ctx.Err()})
+							return
+						default:
+						}
+
+						// Acquire a request token before sending. Pacing up front keeps
+						// the in-flight window true (the semaphore is not held while
+						// sleeping) and spreads request starts across the window.
+						if err := limiter.acquire(ctx); err != nil {
+							send(result{offset: j.offset, err: err})
 							return
 						}
-						if recovered && recoveries < maxDownloadRecoveries {
-							recoveries++
-							currentRPC = recoveredRPC
-							// Exponential backoff between recovery attempts.
-							if backoff == 0 {
-								backoff = time.Second
-							} else {
-								backoff *= 2
-								if backoff > 30*time.Second {
-									backoff = 30 * time.Second
+
+						rpcMu.Lock()
+						rpc := currentRPC
+						rpcMu.Unlock()
+
+						reqStart := time.Now()
+						res, err := rpc.UploadGetFile(ctx, &tg.UploadGetFileRequest{
+							Location: location,
+							Offset:   j.offset,
+							Limit:    j.limit,
+						})
+						chunkElapsed := time.Since(reqStart)
+						if chunkDebug {
+							rpcMu.Lock()
+							w := window
+							rpcMu.Unlock()
+							fmt.Fprintf(os.Stderr, "CHUNK w=%d off=%d el=%v\n", w, j.offset, chunkElapsed.Truncate(time.Millisecond))
+						}
+						limiter.observe(chunkElapsed, j.limit)
+						// Feed the adaptive window: slow responses shrink it, sustained
+						// fast responses grow it. rpcMu also guards window/fastStreak.
+						ref := chunkLatencyScale(j.limit)
+						rpcMu.Lock()
+						if chunkElapsed > 5*ref/2 {
+							if window > minDownloadWindow {
+								window--
+							}
+							fastStreak = 0
+						} else if chunkElapsed < ref {
+							fastStreak++
+							if fastStreak >= 4 && window < maxDownloadWindow {
+								window++
+								fastStreak = 0
+							}
+						} else {
+							fastStreak = 0
+						}
+						rpcMu.Unlock()
+						if err != nil {
+							recoveredRPC, recovered, recoverErr := c.recoverDownloadWorkerRPC(ctx, dcID, len(rpcs), workerIdx, err)
+							if recoverErr != nil {
+								send(result{offset: j.offset, err: recoverErr})
+								return
+							}
+							rpcMu.Lock()
+							allowed := recovered && recoveries < maxDownloadRecoveries
+							var wait time.Duration
+							if allowed {
+								recoveries++
+								currentRPC = recoveredRPC
+								if backoff == 0 {
+									backoff = time.Second
+								} else {
+									backoff *= 2
+									if backoff > 30*time.Second {
+										backoff = 30 * time.Second
+									}
 								}
+								wait = backoff
+							}
+							rpcMu.Unlock()
+							if !allowed {
+								send(result{offset: j.offset, err: fmt.Errorf("download: get file at offset %d: %w", j.offset, err)})
+								return
 							}
 							select {
 							case <-ctx.Done():
-								results <- result{offset: j.offset, err: ctx.Err()}
+								send(result{offset: j.offset, err: ctx.Err()})
 								return
-							case <-time.After(backoff):
+							case <-time.After(wait):
 							}
 							continue
 						}
-						results <- result{offset: j.offset, err: fmt.Errorf("download: get file at offset %d: %w", j.offset, err)}
-						return
-					}
-					recoveries = 0
-					backoff = 0
+						rpcMu.Lock()
+						recoveries = 0
+						backoff = 0
+						rpcMu.Unlock()
 
-					var ok bool
-					file, ok = res.(*tg.UploadFile)
-					if !ok {
-						if _, ok := res.(*tg.UploadFileCDNRedirect); ok {
-							results <- result{offset: j.offset, err: errParallelDownloadUnsupported}
+						var ok bool
+						file, ok = res.(*tg.UploadFile)
+						if !ok {
+							if _, ok := res.(*tg.UploadFileCDNRedirect); ok {
+								send(result{offset: j.offset, err: errParallelDownloadUnsupported})
+								return
+							}
+							send(result{offset: j.offset, err: fmt.Errorf("download: unexpected result type %T", res)})
 							return
 						}
-						results <- result{offset: j.offset, err: fmt.Errorf("download: unexpected result type %T", res)}
+						break
+					}
+
+					if len(file.Bytes) == 0 {
+						send(result{offset: j.offset})
 						return
 					}
-					break
-				}
-
-				if len(file.Bytes) == 0 {
-					results <- result{offset: j.offset}
-					continue
-				}
-				n, err := writer.WriteAt(file.Bytes, j.offset)
-				if err != nil {
-					results <- result{offset: j.offset, n: n, err: fmt.Errorf("download: write at offset %d: %w", j.offset, err)}
-					return
-				}
-				written := done.Add(int64(n))
-				if opts != nil && opts.Progress != nil {
-					opts.Progress(params.ProgressInfo{
-						TotalBytes:      fileSize,
-						DownloadedBytes: written,
-						IsUpload:        false,
-					})
-				}
-				st.reset()
-				results <- result{offset: j.offset, n: n}
-
-				// Pace requests to avoid triggering the DC's rate limiter.
-				if delay := downloadPacingDelay(opts, dcID, c.homeDC()); delay > 0 {
-					select {
-					case <-ctx.Done():
+					n, err := writer.WriteAt(file.Bytes, j.offset)
+					if err != nil {
+						send(result{offset: j.offset, n: n, err: fmt.Errorf("download: write at offset %d: %w", j.offset, err)})
 						return
-					case <-time.After(delay):
 					}
-				}
+					written := done.Add(int64(n))
+					if opts != nil && opts.Progress != nil {
+						opts.Progress(params.ProgressInfo{
+							TotalBytes:      fileSize,
+							DownloadedBytes: written,
+							IsUpload:        false,
+						})
+					}
+					st.reset()
+					send(result{offset: j.offset, n: n})
+				}(j)
 			}
 		}(i)
 	}
@@ -972,9 +1206,9 @@ func (c *Client) downloadToWriterFromOffset(ctx context.Context, rpc *tg.RPCClie
 
 		// Pace requests to avoid triggering the DC's rate limiter.
 		if delay := downloadPacingDelay(opts, dcID, c.homeDC()); delay > 0 {
-		select {
-		case <-ctx.Done():
-			return totalWritten, context.Cause(ctx)
+			select {
+			case <-ctx.Done():
+				return totalWritten, context.Cause(ctx)
 			case <-time.After(delay):
 			}
 		}
@@ -1023,10 +1257,14 @@ func (c *Client) recoverDownloadWorkerRPC(ctx context.Context, dcID int, poolSiz
 	if waitErr := c.waitForDownloadReconnect(ctx); waitErr != nil {
 		return nil, false, fmt.Errorf("download: wait for reconnect: %w", waitErr)
 	}
-	// Same-DC (or unknown DC): the main session recovers independently.
-	// Return it directly instead of creating/replacing side sessions.
+	// Same-DC (or unknown DC): prefer replacing the worker's dead transfer-
+	// pool session with a fresh shared-key session; fall back to the main
+	// session, which recovers independently.
 	homeDC := c.homeDC()
 	if dcID <= 0 || dcID == homeDC || homeDC == 0 {
+		if rpc, ok := c.replaceTransferPoolEntry(ctx, workerIdx); ok {
+			return rpc, true, nil
+		}
 		return c.Raw(), true, nil
 	}
 	rpc, dcErr := c.retryDownloadDCRepair(ctx, func() (*tg.RPCClient, error) {
